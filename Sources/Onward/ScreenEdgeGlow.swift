@@ -143,7 +143,7 @@ import OnwardCore
 /// Reusable transparent renderer. animated:false gives a static peak-opacity QA image.
 /// The backing field is static; Core Animation moves a small masked highlight.
 @MainActor final class ScreenEdgeGlowView: NSView {
-    static let recoveryDuration: TimeInterval = 3
+    static let recoveryDuration: TimeInterval = 5
     struct AnimationDiagnostics {
         let movingHighlight: Bool
         let warningPulse: Bool
@@ -151,6 +151,7 @@ import OnwardCore
         let recoveryParticles: Int
         let recoverySparkles: Int
         let recoveryWaves: Int
+        let recoveryRetreatingRings: Int
         let recoveryDuration: TimeInterval
         let reduceMotion: Bool
         let reduceTransparency: Bool
@@ -174,6 +175,7 @@ import OnwardCore
     private let animationKey = "onward.edge.breathing"
     private let motionKey = "onward.edge.travel"
     private let pulseKey = "onward.edge.pulse"
+    private let retreatKey = "onward.edge.retreat"
     private var movingHighlight: CALayer?
     private var warningPulse: CALayer?
     private var recoveryPulse: CALayer?
@@ -185,6 +187,8 @@ import OnwardCore
             recoveryParticles: recoveryPulse?.sublayers?.filter { $0.name == "recovery.plus" }.count ?? 0,
             recoverySparkles: recoveryPulse?.sublayers?.filter { $0.name == "recovery.sparkle" }.count ?? 0,
             recoveryWaves: recoveryPulse?.sublayers?.filter { $0.name == "recovery.wave" }.count ?? 0,
+            recoveryRetreatingRings: recoveryPulse?.sublayers?.flatMap { $0.sublayers ?? [] }
+                .filter { $0.animation(forKey: retreatKey)?.duration == Self.recoveryDuration }.count ?? 0,
             recoveryDuration: recoveryPulse?.animation(forKey: pulseKey)?.duration ?? 0,
             reduceMotion: glowAppearance?.reduceMotion ?? false,
             reduceTransparency: glowAppearance?.reduceTransparency ?? false)
@@ -262,20 +266,23 @@ import OnwardCore
         let pulse = CALayer(); pulse.frame = bounds; pulse.opacity = 0; pulse.masksToBounds = true
         recoveryPulse = pulse
         layer?.addSublayer(pulse)
-        let base = edgeField(color: mint, reach: 34, alpha: 0.32)
+        let fullMotion = glowAppearance?.reduceMotion == false && glowAppearance?.reduceTransparency == false
+        let retreatDuration = fullMotion ? Self.recoveryDuration : nil
+        let base = edgeField(color: mint, reach: 76, alpha: 0.36, retreatDuration: retreatDuration)
         base.opacity = 1; pulse.addSublayer(base)
-        if glowAppearance?.reduceMotion == false, glowAppearance?.reduceTransparency == false {
+        if fullMotion {
             for index in 0..<2 {
-                let wave = edgeField(color: index == 0 ? aqua : mint, reach: index == 0 ? 46 : 38, alpha: 0.18)
+                let wave = edgeField(color: index == 0 ? aqua : mint, reach: index == 0 ? 68 : 54,
+                                     alpha: 0.15, retreatDuration: Self.recoveryDuration)
                 wave.name = "recovery.wave"; pulse.addSublayer(wave)
-                animatePulse(wave, duration: 1.65, delay: Double(index) * 0.85)
+                animatePulse(wave, duration: 3.4, delay: Double(index) * 0.7)
             }
             addRecoveryParticles(to: pulse, mint: mint, aqua: aqua)
         }
-        // Hold enough light for both particle waves, then let the whole effect settle.
+        // A brief arrival, then decreasing light and inward reach for the full recovery.
         let fade = CAKeyframeAnimation(keyPath: "opacity")
-        fade.values = [0, 1, 0.86, 0.72, 0]
-        fade.keyTimes = [0, 0.07, 0.40, 0.72, 1]
+        fade.values = [0, 1, 0.80, 0.46, 0]
+        fade.keyTimes = [0, 0.035, 0.35, 0.72, 1]
         fade.duration = Self.recoveryDuration
         fade.timingFunctions = [CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1),
                                 CAMediaTimingFunction(name: .linear), CAMediaTimingFunction(name: .linear),
@@ -318,7 +325,8 @@ import OnwardCore
         movingHighlight = container
     }
 
-    private func edgeField(color: NSColor, reach: CGFloat, alpha: CGFloat) -> CALayer {
+    private func edgeField(color: NSColor, reach: CGFloat, alpha: CGFloat,
+                           retreatDuration: TimeInterval? = nil) -> CALayer {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
@@ -338,6 +346,22 @@ import OnwardCore
             ring.strokeColor = color.withAlphaComponent(reduceTransparency ? 1 : alpha * pow(1 - inset / reach, 2.3)).cgColor
             ring.lineWidth = width
             field.addSublayer(ring)
+            if let retreatDuration, !reduceTransparency {
+                // Fade each inward ring as the edge field contracts. Scaling a full-screen
+                // rectangle would pull the glow away from the physical screen edges.
+                let originalFalloff = pow(1 - inset / reach, 2.3)
+                let retreat = CAKeyframeAnimation(keyPath: "opacity")
+                let progress = (0...20).map { CGFloat($0) / 20 }
+                retreat.values = progress.map { value -> CGFloat in
+                    let currentReach = reach * (1 - value)
+                    guard currentReach > inset else { return 0 }
+                    return pow(1 - inset / currentReach, 2.3) / originalFalloff
+                }
+                retreat.keyTimes = progress.map { NSNumber(value: Double($0)) }
+                retreat.duration = retreatDuration
+                ring.opacity = 0
+                ring.add(retreat, forKey: retreatKey)
+            }
         }
         return field
     }
@@ -375,15 +399,15 @@ import OnwardCore
             rise.values = [NSValue(size: .zero), NSValue(size: NSSize(width: drift * 0.5, height: height * 0.64)),
                            NSValue(size: NSSize(width: drift, height: height))]
             rise.keyTimes = [0, 0.55, 1]
-            rise.duration = 1.8
+            rise.duration = 2.5
             rise.timingFunctions = [CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1), CAMediaTimingFunction(name: .easeOut)]
             let scale = CAKeyframeAnimation(keyPath: "transform.scale")
-            scale.values = [0.9, 1.12, 1]; scale.keyTimes = [0, 0.22, 1]; scale.duration = 1.8
+            scale.values = [0.9, 1.12, 1]; scale.keyTimes = [0, 0.22, 1]; scale.duration = 2.5
             let fade = CAKeyframeAnimation(keyPath: "opacity")
-            fade.values = [0, 0.95, 0.75, 0]; fade.keyTimes = [0, 0.14, 0.60, 1]; fade.duration = 1.8
+            fade.values = [0, 0.95, 0.75, 0]; fade.keyTimes = [0, 0.14, 0.60, 1]; fade.duration = 2.5
             let animation = CAAnimationGroup(); animation.animations = [rise, scale, fade]
-            animation.duration = 1.8
-            animation.beginTime = start + 0.08 + Double(wave) * 0.8 + Double(column) * 0.025
+            animation.duration = 2.5
+            animation.beginTime = start + 0.1 + Double(wave) * 1.7 + Double(column) * 0.055
             field.addSublayer(particle)
             particle.add(animation, forKey: pulseKey)
         }
@@ -399,12 +423,12 @@ import OnwardCore
             path.addLine(to: CGPoint(x: size / 2, y: size)); path.addLine(to: CGPoint(x: 0, y: size / 2)); path.closeSubpath()
             sparkle.path = path; sparkle.fillColor = (left ? aqua : mint).cgColor; sparkle.opacity = 0
             let rise = CABasicAnimation(keyPath: "transform.translation.y")
-            rise.fromValue = 0; rise.toValue = 36 + index % 3 * 10; rise.duration = 1.5
+            rise.fromValue = 0; rise.toValue = 36 + index % 3 * 10; rise.duration = 2.4
             rise.timingFunction = CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
             let fade = CAKeyframeAnimation(keyPath: "opacity")
-            fade.values = [0, 0.8, 0.4, 0]; fade.keyTimes = [0, 0.2, 0.65, 1]; fade.duration = 1.5
+            fade.values = [0, 0.8, 0.4, 0]; fade.keyTimes = [0, 0.2, 0.65, 1]; fade.duration = 2.4
             let animation = CAAnimationGroup(); animation.animations = [rise, fade]
-            animation.duration = 1.5; animation.beginTime = start + 0.12 + Double(index) * 0.065
+            animation.duration = 2.4; animation.beginTime = start + 0.12 + Double(index) * 0.13
             field.addSublayer(sparkle); sparkle.add(animation, forKey: pulseKey)
         }
     }

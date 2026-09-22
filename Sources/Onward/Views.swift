@@ -455,7 +455,7 @@ struct SettingsView: View {
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     SettingsToggle(title: "Show screen-edge glow", isOn: $model.showScreenGlow)
-                    Text("A slight moving yellow glow when you drift. Red pulses with warnings. Returning to your goal gives a three-second aqua-green healing effect with rising plus signs and sparkles.")
+                    Text("A slight moving yellow glow when you drift. Red pulses with warnings. Returning to your goal gives a five-second aqua-green healing effect that starts broad and shrinks, with rising plus signs and sparkles. It stops if you leave green.")
                         .font(.system(size: 12)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
                 }
                 VStack(alignment: .leading, spacing: 6) {

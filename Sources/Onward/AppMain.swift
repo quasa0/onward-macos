@@ -41,6 +41,7 @@ import Darwin
     private let screenGlow = ScreenEdgeGlowController()
     private var hoverTimer: Timer?
     private var hudVisibility = HUDVisibilityPolicy()
+    private var hudFader: HUDPanelFader?
     private let showWindowOnLaunch: Bool
     private let resumeSession: Bool
     private var subscriptions = Set<AnyCancellable>()
@@ -71,6 +72,7 @@ import Darwin
         hud.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
         hud.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         hud.contentView = NSHostingView(rootView: GoalHUD(model: model))
+        hudFader = HUDPanelFader(panel: hud)
         model.objectWillChange.sink { [weak self] _ in DispatchQueue.main.async { self?.updateChrome() } }.store(in: &subscriptions)
         NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification).sink { [weak self] _ in self?.updateChrome() }.store(in: &subscriptions)
         let hoverTimer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
@@ -88,7 +90,7 @@ import Darwin
     func windowWillClose(_ notification: Notification) { model?.setCameraPreviewVisible(false) }
     func windowDidMiniaturize(_ notification: Notification) { model?.setCameraPreviewVisible(false) }
     func windowDidDeminiaturize(_ notification: Notification) { updateCameraPreviewVisibility() }
-    func applicationWillTerminate(_ notification: Notification) { hoverTimer?.invalidate(); screenGlow.stop(); model?.stop(); hud?.close() }
+    func applicationWillTerminate(_ notification: Notification) { hoverTimer?.invalidate(); hudFader?.stop(); screenGlow.stop(); model?.stop(); hud?.close() }
     private func installMenus() {
         let menu = NSMenu()
         func addMenu(_ title: String, _ items: [NSMenuItem]) -> NSMenu {
@@ -163,8 +165,82 @@ import Darwin
         let visible = hudVisibility.shouldShow(enabled: model.showHUD && !model.goal.isEmpty,
                                               pointer: NSEvent.mouseLocation, frame: hud.frame,
                                               at: ProcessInfo.processInfo.systemUptime)
-        if visible && !hud.isVisible { hud.orderFrontRegardless() }
-        else if !visible && hud.isVisible { hud.orderOut(nil) }
+        hudFader?.setVisible(visible, reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) { completionHandler([.banner]) }
+}
+
+/// Opacity is tracked explicitly so a reversal starts at the last displayed alpha,
+/// rather than an animation proxy's target value. Ordering in never exposes alpha 1.
+@MainActor private final class HUDPanelFader {
+    private weak var panel: NSPanel?
+    private var timer: Timer?
+    private var generation = UUID()
+    private var requestedVisible = false
+    private var reduceMotion = false
+    private var alpha: CGFloat = 0
+    private var startAlpha: CGFloat = 0
+    private var targetAlpha: CGFloat = 0
+    private var startedAt: TimeInterval = 0
+    private var duration: TimeInterval = 0
+
+    init(panel: NSPanel) {
+        self.panel = panel
+        panel.animationBehavior = .none
+        panel.alphaValue = 0
+    }
+
+    func setVisible(_ visible: Bool, reduceMotion: Bool) {
+        guard let panel else { stop(); return }
+        let externallyHidden = visible && !panel.isVisible
+        guard requestedVisible != visible || self.reduceMotion != reduceMotion || externallyHidden else { return }
+        requestedVisible = visible; self.reduceMotion = reduceMotion
+        timer?.invalidate(); timer = nil
+        generation = UUID()
+        let token = generation
+        // The window can be hidden externally (for example by macOS). Always reveal
+        // from transparency when ordering it back in, including the first display.
+        if externallyHidden {
+            alpha = 0; panel.alphaValue = 0
+            panel.orderFrontRegardless()
+        }
+        startAlpha = alpha; targetAlpha = visible ? 1 : 0
+        guard abs(targetAlpha - startAlpha) > 0.001 else {
+            finish(generation: token); return
+        }
+        startedAt = ProcessInfo.processInfo.systemUptime
+        // Reduce Motion keeps a short dissolve, with no scale or translation.
+        duration = reduceMotion ? 0.08 : (visible ? 0.40 : 0.14)
+        let timer = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.advance(generation: token) }
+        }
+        timer.tolerance = 0.002
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func advance(generation token: UUID) {
+        guard generation == token else { return }
+        guard let panel else { stop(); return }
+        let progress = min(1, max(0, (ProcessInfo.processInfo.systemUptime - startedAt) / duration))
+        let eased = requestedVisible ? progress * progress * (3 - 2 * progress) : 1 - pow(1 - progress, 3)
+        alpha = startAlpha + (targetAlpha - startAlpha) * CGFloat(eased)
+        panel.alphaValue = alpha
+        if progress >= 1 { finish(generation: token) }
+    }
+
+    private func finish(generation token: UUID) {
+        guard generation == token else { return }
+        timer?.invalidate(); timer = nil
+        alpha = targetAlpha; panel?.alphaValue = alpha
+        if !requestedVisible { panel?.orderOut(nil) }
+    }
+
+    func stop() {
+        generation = UUID(); timer?.invalidate(); timer = nil
+        requestedVisible = false; alpha = 0; targetAlpha = 0
+        panel?.alphaValue = 0; panel?.orderOut(nil)
+    }
+
+    deinit { timer?.invalidate() }
 }

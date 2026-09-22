@@ -366,24 +366,35 @@ enum CommandLineTools {
         view.update(status: .focused)
         let recovery = view.animationDiagnostics
         let fullMotion = !options.reduceMotion && !options.reduceTransparency
-        guard recovery.recoveryPulse, recovery.recoveryDuration == 3,
+        guard recovery.recoveryPulse, recovery.recoveryDuration == 5,
               recovery.recoveryParticles == (fullMotion ? 24 : 0),
               recovery.recoverySparkles == (fullMotion ? 18 : 0),
-              recovery.recoveryWaves == (fullMotion ? 2 : 0) else {
-            throw CLIError.message("Recovery effect did not retain its three-second pulse and appropriate effects.")
+              recovery.recoveryWaves == (fullMotion ? 2 : 0),
+              (recovery.recoveryRetreatingRings > 0) == fullMotion else {
+            throw CLIError.message("Recovery effect did not retain its five-second shrinking pulse and appropriate effects.")
         }
         view.frame.size = NSSize(width: 900, height: 600)
         guard !view.animationDiagnostics.recoveryPulse else { throw CLIError.message("Recovery effect survived a display resize.") }
-        view.playRecoveryPulse()
-        view.update(status: .drifting)
-        guard !view.animationDiagnostics.recoveryPulse else { throw CLIError.message("Recovery effect survived a warning transition.") }
+        for status in [FocusStatus.drifting, .distracted, .paused, .idle] {
+            view.update(status: .focused)
+            view.playRecoveryPulse()
+            view.update(status: status)
+            guard !view.animationDiagnostics.recoveryPulse, view.animationDiagnostics.recoveryRetreatingRings == 0 else {
+                throw CLIError.message("Recovery effect survived leaving green for \(status.rawValue).")
+            }
+            view.playRecoveryPulse()
+            guard !view.animationDiagnostics.recoveryPulse else {
+                throw CLIError.message("Recovery effect started outside green.")
+            }
+        }
         view.stopAnimating()
         let stopped = view.animationDiagnostics
         guard !stopped.movingHighlight, !stopped.warningPulse, !stopped.recoveryPulse,
-              stopped.recoveryParticles == 0, stopped.recoverySparkles == 0, stopped.recoveryWaves == 0 else {
+              stopped.recoveryParticles == 0, stopped.recoverySparkles == 0, stopped.recoveryWaves == 0,
+              stopped.recoveryRetreatingRings == 0 else {
             throw CLIError.message("Glow effects did not stop cleanly.")
         }
-        print("PASS animated glow: movement, warning pulse, three-second recovery, 24 plus signs, 18 sparkles, two waves, accessibility gates and cleanup (offscreen)")
+        print("PASS animated glow: movement, warning pulse, five-second shrinking recovery, 24 plus signs, 18 sparkles, two waves, immediate non-green cancellation, accessibility gates and cleanup (offscreen)")
     }
     @MainActor private static func smokeGoalReview() throws {
         let model = ObserverModel(audioEnabled: false, persistenceEnabled: false)

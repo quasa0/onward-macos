@@ -487,7 +487,7 @@ struct CameraAttentionSettingsView: View {
         switch snapshot.status {
         case .disabled: return model.cameraEnabled ? "Camera paused" : "Camera off"
         case .permissionNeeded: return "Camera permission needed"
-        case .calibrating: return "Calibrating — look at the center of your screen"
+        case .calibrating: return "Calibrating — look at the target dot"
         case .present: return snapshot.calibrated ? "Facing the screen" : "Face detected"
         case .lookingAway: return snapshot.isDistracted ? "Looking away" : "Looking away · within grace period"
         case .absent: return snapshot.isDistracted ? "No face detected" : "No face detected · within grace period"
@@ -539,15 +539,20 @@ struct CameraAttentionSettingsView: View {
                 }
                 if model.cameraEnabled {
                     HStack(spacing: 12) {
-                        Button(snapshot.calibrated ? "Recalibrate" : "Calibrate for this screen", systemImage: "viewfinder", action: model.calibrateCamera)
+                        Button(snapshot.calibrated ? "Recalibrate" : "Calibrate for this screen", systemImage: "viewfinder") {
+                            NotificationCenter.default.post(name: .onwardNavigate, object: "Camera calibration")
+                        }
                             .disabled(snapshot.status == .calibrating || model.cameraPermissionPending)
-                        Text(snapshot.calibrated ? "Calibrate again if your screen or position changes." : "Look at the center of your screen and hold still.")
+                        Text(snapshot.calibrated ? "Calibrate again if your screen or position changes." : "Open calibration and follow the target dot.")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    Button("Open live camera view", systemImage: "camera") {
+                        NotificationCenter.default.post(name: .onwardNavigate, object: "Camera")
+                    }
                 }
             }
-            Text("Allows 8 seconds of looking away or 12 seconds without a face before treating it as distraction. Pauses with your focus session, except during calibration.")
+            Text("Allows 8 seconds of looking away or 12 seconds without a face before treating it as distraction. Calibration shows a target, timer and your live camera view.")
                 .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(2)
                 .fixedSize(horizontal: false, vertical: true)
             Text("Attention is approximate. The camera cannot tell what you are looking at or whether you are using a phone.")

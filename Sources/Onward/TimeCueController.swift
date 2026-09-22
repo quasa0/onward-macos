@@ -6,6 +6,7 @@ import OnwardCore
 @MainActor
 final class TimeCueController {
     var onCue: () -> Void
+    private let sessionAllowsCue: () -> Bool
 
     private var enabled = false
     private var suspended = false
@@ -16,7 +17,11 @@ final class TimeCueController {
     private var timingActivity: NSObjectProtocol?
     private var generation = UUID()
 
-    init(onCue: @escaping () -> Void = {}) {
+    init(sessionAllowsCue: @escaping () -> Bool = {
+        guard let foreground = NSWorkspace.shared.frontmostApplication else { return false }
+        return foreground.bundleIdentifier != "com.apple.loginwindow"
+    }, onCue: @escaping () -> Void = {}) {
+        self.sessionAllowsCue = sessionAllowsCue
         self.onCue = onCue
     }
 
@@ -108,8 +113,7 @@ final class TimeCueController {
         let shouldEmit = schedule.consume(at: Date())
         self.schedule = schedule
         // Also cover a lock that occurs before the owner's session notification arrives.
-        if shouldEmit, let foreground = NSWorkspace.shared.frontmostApplication,
-           foreground.bundleIdentifier != "com.apple.loginwindow" {
+        if shouldEmit, sessionAllowsCue() {
             onCue()
         }
         // The callback can disable, suspend, or reconfigure its owner synchronously.

@@ -1,4 +1,5 @@
 import XCTest
+import CoreGraphics
 @testable import OnwardCore
 
 final class AttentionPresenceTests: XCTestCase {
@@ -83,6 +84,57 @@ final class AttentionPresenceTests: XCTestCase {
         XCTAssertFalse(snapshot.isFresh(at: start.addingTimeInterval(-1)))
     }
 
+    func testSnapshotPreviewGeometryIsOptionalAndPreservesVisionCoordinates() {
+        let empty = CameraAttentionSnapshot(status: .disabled)
+        XCTAssertNil(empty.faceBounds)
+        XCTAssertTrue(empty.pupilPoints.isEmpty)
+        XCTAssertNil(empty.gazeOffset)
+        XCTAssertEqual(empty.calibrationProgress, 0)
+        XCTAssertNil(empty.calibrationSecondsRemaining)
+        let face = CGRect(x: 0.2, y: 0.3, width: 0.4, height: 0.5)
+        let pupils = [CGPoint(x: 0.3, y: 0.6), CGPoint(x: 0.5, y: 0.6)]
+        let snapshot = CameraAttentionSnapshot(status: .calibrating, faceBounds: face,
+                                               pupilPoints: pupils, gazeOffset: CGPoint(x: -0.5, y: 0.25),
+                                               calibrationProgress: 0.4, calibrationSecondsRemaining: 12)
+        XCTAssertEqual(snapshot.faceBounds, face)
+        XCTAssertEqual(snapshot.pupilPoints, pupils)
+        XCTAssertEqual(snapshot.gazeOffset, CGPoint(x: -0.5, y: 0.25))
+        XCTAssertEqual(snapshot.calibrationProgress, 0.4)
+        XCTAssertEqual(snapshot.calibrationSecondsRemaining, 12)
+    }
+
+    func testDisplayGazeUsesUserRelativePupilDirectionAndClampsIt() throws {
+        let calibration = CameraGazeCalibration(baseline: centered)
+        XCTAssertEqual(calibration.gazeOffset(for: centered), .zero)
+        var sample = centered
+        sample.leftPupilX = 0.61; sample.rightPupilX = 0.61
+        sample.leftPupilY = 0.07; sample.rightPupilY = 0.07
+        let offset = try XCTUnwrap(calibration.gazeOffset(for: sample))
+        XCTAssertEqual(offset.x, -0.5, accuracy: 0.0001)
+        XCTAssertEqual(offset.y, 0.5, accuracy: 0.0001)
+        sample.leftPupilX = 0; sample.rightPupilX = 0
+        sample.leftPupilY = 0.4; sample.rightPupilY = 0.4
+        XCTAssertEqual(calibration.gazeOffset(for: sample), CGPoint(x: 1, y: 1))
+        sample.leftPupilX = 1; sample.rightPupilX = 1
+        sample.leftPupilY = -0.4; sample.rightPupilY = -0.4
+        XCTAssertEqual(calibration.gazeOffset(for: sample), CGPoint(x: -1, y: -1))
+        sample = centered; sample.yaw = 0.7; sample.pitch = 0.5
+        XCTAssertEqual(calibration.gazeOffset(for: sample), .zero)
+        XCTAssertEqual(calibration.evidence(for: sample), .lookingAway)
+    }
+
+    func testDisplayGazeRejectsMissingInvalidAndDisagreeingEyes() {
+        let calibration = CameraGazeCalibration(baseline: centered)
+        XCTAssertNil(calibration.gazeOffset(for: nil))
+        var sample = centered; sample.leftPupilX = 0.8
+        XCTAssertNil(calibration.gazeOffset(for: sample))
+        sample = centered; sample.rightPupilY = 0.2
+        XCTAssertNil(calibration.gazeOffset(for: sample))
+        sample = centered; sample.pitch = .nan
+        XCTAssertNil(calibration.gazeOffset(for: sample))
+        XCTAssertNil(CameraGazeCalibration(baseline: sample).gazeOffset(for: centered))
+    }
+
     func testGazeUsesHeadPoseAndAgreedPupilsWithUnknownBand() {
         let calibration = CameraGazeCalibration(baseline: centered)
         XCTAssertEqual(calibration.evidence(for: centered), .present)
@@ -110,6 +162,51 @@ final class AttentionPresenceTests: XCTestCase {
         XCTAssertEqual(calibrator.add(centered, at: start.addingTimeInterval(2.5))?.baseline, centered)
         var rushed = CameraGazeCalibrator()
         for index in 0..<12 { XCTAssertNil(rushed.add(centered, at: start.addingTimeInterval(Double(index) * 0.01))) }
+    }
+
+    func testCalibrationProgressRequiresBothSampleCountAndStableTime() {
+        var calibrator = CameraGazeCalibrator()
+        XCTAssertEqual(calibrator.progress, 0)
+        for index in 0..<5 {
+            XCTAssertNil(calibrator.add(centered, at: start.addingTimeInterval(Double(index) * 0.5)))
+            XCTAssertEqual(calibrator.progress, Double(index) / 5, accuracy: 0.0001)
+            XCTAssertLessThan(calibrator.progress, 1)
+        }
+        XCTAssertNotNil(calibrator.add(centered, at: start.addingTimeInterval(2.5)))
+        XCTAssertEqual(calibrator.progress, 1)
+        XCTAssertEqual(calibrator.reason, "Calibration complete.")
+        var rushed = CameraGazeCalibrator()
+        for index in 0..<12 {
+            XCTAssertNil(rushed.add(centered, at: start.addingTimeInterval(Double(index) * 0.01)))
+            XCTAssertLessThan(rushed.progress, 1)
+        }
+        var sparse = CameraGazeCalibrator()
+        XCTAssertNil(sparse.add(centered, at: start))
+        XCTAssertNil(sparse.add(centered, at: start.addingTimeInterval(2.5)))
+        XCTAssertEqual(sparse.progress, 2.0 / 6, accuracy: 0.0001)
+    }
+
+    func testCalibrationProgressAndFeedbackResetForInvalidMovementAndInterruptedFrames() {
+        var calibrator = CameraGazeCalibrator()
+        for index in 0..<4 { _ = calibrator.add(centered, at: start.addingTimeInterval(Double(index) * 0.5)) }
+        XCTAssertGreaterThan(calibrator.progress, 0)
+        XCTAssertNil(calibrator.add(nil, at: start.addingTimeInterval(2)))
+        XCTAssertEqual(calibrator.progress, 0)
+        XCTAssertTrue(calibrator.reason.contains("eyes"))
+        _ = calibrator.add(centered, at: start.addingTimeInterval(2.5))
+        var moved = centered; moved.yaw = 0.2
+        XCTAssertNil(calibrator.add(moved, at: start.addingTimeInterval(3)))
+        XCTAssertEqual(calibrator.progress, 0)
+        XCTAssertTrue(calibrator.reason.contains("Movement"))
+        moved.yaw = 0.8
+        XCTAssertNil(calibrator.add(moved, at: start.addingTimeInterval(3.5)))
+        XCTAssertEqual(calibrator.progress, 0)
+        XCTAssertTrue(calibrator.reason.contains("Face the screen"))
+        _ = calibrator.add(centered, at: start.addingTimeInterval(4))
+        _ = calibrator.add(centered, at: start.addingTimeInterval(4.5))
+        XCTAssertNil(calibrator.add(centered, at: start.addingTimeInterval(8)))
+        XCTAssertEqual(calibrator.progress, 0)
+        XCTAssertTrue(calibrator.reason.contains("interrupted"))
     }
 
     func testCalibrationRejectsMissingEyesMovementAndOffCenterHeadPose() {

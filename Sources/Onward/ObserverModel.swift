@@ -42,6 +42,7 @@ import OnwardCore
     @Published private(set) var cameraEnabled = UserDefaults.standard.bool(forKey: "cameraAttentionEnabled")
     @Published private(set) var cameraPermissionPending = false
     @Published private(set) var cameraSnapshot = CameraAttentionSnapshot(status: .disabled)
+    @Published private(set) var cameraFrame: CGImage?
     @Published private(set) var lastRequestData: Data?
     @Published var startedAt: Date?
     @Published var now = Date()
@@ -80,6 +81,7 @@ import OnwardCore
     private var spendStore: JevSpendFileStore?
     private var lastSpendRead = Date.distantPast
     private var cameraController: CameraAttentionController?
+    private var cameraPreviewVisible = false
     private var cameraPermissionTask: Task<Void, Never>?
     private var cameraOverrideActive = false
     private var policy = FocusPolicy()
@@ -102,6 +104,8 @@ import OnwardCore
     private var retryAfter = Date.distantPast
     private var lastAlertAt = Date.distantPast
     private var distractionReminder = DistractionReminder()
+    private var distractionReminderTimer: Timer?
+    private var distractionReminderTimerID = UUID()
     private var systemSleeping = false
     private var sessionInactive = false
     private var sleeping: Bool { systemSleeping || sessionInactive }
@@ -119,14 +123,15 @@ import OnwardCore
                 if let active = activeSavedGoal { goal = active.goal; context = active.context }
             } catch { knowledgeError = "Saved goals could not be loaded. Existing data has been kept intact." }
             refreshSpend()
-            cameraController = CameraAttentionController { [weak self] snapshot in
+            cameraController = CameraAttentionController(onUpdate: { [weak self] snapshot in
                 guard let self else { return }
+                self.now = Date()
                 self.cameraSnapshot = snapshot
                 if self.isRunning && !self.sleeping &&
                     (SystemActivity.idleSeconds < 300 || self.cameraOverrideActive || self.freshCameraDistraction) {
                     self.updateStatus()
                 }
-            }
+            }, onFrame: { [weak self] frame in self?.cameraFrame = frame })
             configureCamera()
         } else {
             cameraEnabled = false
@@ -190,6 +195,7 @@ import OnwardCore
         isRunning = false; resetEvidence(); timer?.invalidate(); timer = nil
         cameraPermissionTask?.cancel(); cameraPermissionTask = nil
         cameraController?.stop(); cameraController = nil
+        cameraFrame = nil; cameraPreviewVisible = false
         timeCueController?.stop(); timeCueController = nil
         SoundPlayer.shared.stopAll()
         if publishStatus { publishBrowserStatus() }
@@ -197,6 +203,8 @@ import OnwardCore
         observers = []; detachAX()
     }
     private func resetEvidence() {
+        distractionReminderTimerID = UUID()
+        distractionReminderTimer?.invalidate(); distractionReminderTimer = nil
         revision = UUID(); classificationTask?.cancel(); classificationTask = nil
         activeRequestID = nil; needsCapture = true
         policy.reset(); judgment = nil; lastJudgmentFingerprint = ""; lastJudgmentSurface = nil; distractionReminder.reset()
@@ -216,6 +224,7 @@ import OnwardCore
         if isRunning { status = sleeping ? .idle : .observing }
     }
     private func tick() {
+        defer { remindIfNeeded() }
         now = Date(); accessibilityGranted = AXIsProcessTrusted(); screenGranted = CGPreflightScreenCaptureAccess()
         if now.timeIntervalSince(lastSpendRead) >= 10 { refreshSpend() }
         configureCamera()
@@ -453,12 +462,14 @@ import OnwardCore
               NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.apple.loginwindow" else { return }
         if updateCameraDistraction() { return }
         guard error == nil else { status = .unavailable; return }
+        let timestamp = Date()
         guard let current = observation,
-              lastJudgmentSurface?.canDisplayJudgment(for: current, foregroundPID: NSWorkspace.shared.frontmostApplication?.processIdentifier, at: Date()) == true else { status = .observing; return }
+              lastJudgmentSurface?.canDisplayJudgment(for: current, foregroundPID: NSWorkspace.shared.frontmostApplication?.processIdentifier, at: timestamp) == true else { status = .observing; return }
         let previous = status
         let previousDisplay = displayStatus
-        status = policy.status(at: Date())
-        // Retaining a color does not establish new evidence for a reminder.
+        policy.resume(at: timestamp)
+        status = policy.status(at: timestamp)
+        // Recovery needs fresh evidence. Red repeats separately follow the visible color.
         guard !policy.isHoldingStatus else { return }
         if status == .focused && [.drifting, .distracted].contains(previousDisplay) { recoveryPulseID += 1 }
         if status == .drifting && previous != .drifting && Date().timeIntervalSince(lastAlertAt) > 90 {
@@ -496,12 +507,34 @@ import OnwardCore
         return true
     }
     private func remindIfNeeded() {
-        guard !policy.isHoldingStatus,
-              distractionReminder.shouldRemind(status: status, confirmedSeconds: policy.offGoalDuration(at: Date()),
-                                                episodeStartedAt: policy.offGoalSince) else { return }
+        let redVisible = isRunning && !sleeping && displayStatus == .distracted &&
+            ![FocusStatus.paused, .idle, .ready].contains(status) &&
+            NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.apple.loginwindow"
+        let cue = distractionReminder.cue(isRedVisible: redVisible, at: ProcessInfo.processInfo.systemUptime)
+        guard redVisible else {
+            distractionReminderTimerID = UUID()
+            distractionReminderTimer?.invalidate(); distractionReminderTimer = nil
+            return
+        }
+        guard let cue else { return }
+        distractionReminderTimer?.invalidate()
+        if let next = distractionReminder.nextReminderAt {
+            let timerID = UUID(); distractionReminderTimerID = timerID
+            let timer = Timer(timeInterval: max(0.01, next - ProcessInfo.processInfo.systemUptime), repeats: false) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, self.distractionReminderTimerID == timerID else { return }
+                    self.distractionReminderTimer = nil; self.remindIfNeeded()
+                }
+            }
+            timer.tolerance = 0.03
+            RunLoop.main.add(timer, forMode: .common)
+            distractionReminderTimer = timer
+        }
         warningPulseID += 1
-        alert(title: cameraOverrideActive ? "Look back at your screen" : "Come back to your goal",
-              body: cameraDistractionReason ?? goal, sound: soundEnabled)
+        if cue == .enteredRed {
+            alert(title: cameraOverrideActive ? "Look back at your screen" : "Come back to your goal",
+                  body: cameraDistractionReason ?? goal, sound: soundEnabled)
+        } else if soundEnabled { playWarningSound(restart: false) }
     }
     func setCameraEnabled(_ enabled: Bool) {
         cameraPermissionTask?.cancel(); cameraPermissionPending = false
@@ -530,10 +563,22 @@ import OnwardCore
         guard cameraEnabled, !sleeping else { return }
         cameraController?.calibrate()
     }
+    func cancelCameraCalibration() { cameraController?.cancelCalibration() }
+    func setCameraPreviewVisible(_ visible: Bool) {
+        guard cameraPreviewVisible != visible else { return }
+        cameraPreviewVisible = visible
+        if !visible { cameraFrame = nil }
+        configureCamera()
+    }
+    /// Synthetic offscreen QA never opens a camera or writes preferences.
+    func setCameraPreviewFixture(frame: CGImage?, snapshot: CameraAttentionSnapshot) {
+        guard goalStore == nil, cameraController == nil else { return }
+        now = Date(); cameraEnabled = true; cameraFrame = frame; cameraSnapshot = snapshot
+    }
     private func configureCamera() {
         let unlocked = NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.apple.loginwindow"
         cameraController?.configure(enabled: cameraEnabled, active: isRunning && !sleeping && unlocked,
-                                    suspended: sleeping || !unlocked)
+                                    suspended: sleeping || !unlocked, previewVisible: cameraPreviewVisible)
     }
     func correct(_ alignment: Alignment) {
         guard let observation else { return }

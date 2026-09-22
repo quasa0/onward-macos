@@ -57,6 +57,7 @@ struct Dashboard: View {
     @State private var inspect = false
     @State private var correctionMessage: String?
     @State private var reviewSection = "To review"
+    @State private var cameraCalibration = false
 
     init(model: ObserverModel, initialSelection: String = "Now", initialReviewSection: String = "To review") {
         self.model = model
@@ -76,6 +77,7 @@ struct Dashboard: View {
                     else if selection == "Goals" { GoalsView(model: model) }
                     else if selection == "Review" { ReviewView(model: model, initialSection: reviewSection) }
                     else if selection == "Activity" { activityView }
+                    else if selection == "Camera" { CameraAttentionView(model: model, calibrate: { cameraCalibration = true }) }
                     else { SettingsView(model: model) }
                 }.padding(32).frame(maxWidth: 800, alignment: .leading).frame(maxWidth: .infinity)
             }.background(Color(nsColor: .windowBackgroundColor))
@@ -89,10 +91,12 @@ struct Dashboard: View {
             .onReceive(NotificationCenter.default.publisher(for: .onwardNavigate)) { notification in
                 if let destination = notification.object as? String {
                     if destination == "Review" { openReview() }
+                    else if destination == "Camera calibration" { selection = "Camera"; cameraCalibration = true }
                     else { selection = destination }
                 }
             }
             .sheet(isPresented: $inspect) { EvidenceView(model: model) }
+            .sheet(isPresented: $cameraCalibration) { CameraCalibrationView(model: model) }
     }
 
     private var sidebar: some View {
@@ -113,6 +117,7 @@ struct Dashboard: View {
                     }
                 }.tag("Review")
                 Label("Activity", systemImage: "clock.arrow.circlepath").tag("Activity")
+                Label("Camera", systemImage: "camera").tag("Camera")
                 Label("Settings", systemImage: "slider.horizontal.3").tag("Settings")
             }.listStyle(.sidebar).scrollContentBackground(.hidden).font(.system(size: 13))
             VStack(alignment: .leading, spacing: 6) {
@@ -140,6 +145,9 @@ struct Dashboard: View {
                 Text(statusDetail).font(.system(size: 13)).foregroundStyle(muted)
                     .fixedSize(horizontal: false, vertical: true).lineSpacing(3)
             }.padding(.top, 4)
+            if model.cameraEnabled {
+                CameraPreviewCard(model: model, open: { selection = "Camera" }, calibrate: { cameraCalibration = true })
+            }
             Card {
                 VStack(alignment: .leading, spacing: 18) {
                     VStack(alignment: .leading, spacing: 9) {
@@ -447,12 +455,12 @@ struct SettingsView: View {
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     SettingsToggle(title: "Show screen-edge glow", isOn: $model.showScreenGlow)
-                    Text("A slight moving yellow glow when you drift. Red pulses with warnings. Returning to your goal gives a brief aqua-green pulse with rising plus signs.")
+                    Text("A slight moving yellow glow when you drift. Red pulses with warnings. Returning to your goal gives a three-second aqua-green healing effect with rising plus signs and sparkles.")
                         .font(.system(size: 12)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     SettingsToggle(title: "Play a sound while distracted", isOn: $model.soundEnabled)
-                    Text("At the start of red, then every 30 seconds while distraction continues.")
+                    Text("At the start of red, then every 3–7 seconds at random.")
                         .font(.system(size: 12)).foregroundStyle(muted)
                 }
                 VStack(alignment: .leading, spacing: 8) {
@@ -474,13 +482,14 @@ struct SettingsView: View {
                 SoundVolumeControl(title: "Warning volume", volume: $model.warningVolume, preview: model.previewWarningSound)
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("Turn red after time away from your goal")
+                        Text("Turn red after confirmed distraction")
                         Spacer()
                         Text("\(Int(model.redAfter)) seconds").monospacedDigit().foregroundStyle(muted)
                     }
                     Slider(value: $model.redAfter, in: 15...180, step: 15)
                         .accessibilityLabel("Seconds away from goal before turning red")
                         .accessibilityValue("\(Int(model.redAfter)) seconds")
+                    Text("Checking and uncertain readings pause this timer.").font(.system(size: 12)).foregroundStyle(muted)
                 }
                 HStack(spacing: 10) {
                     Button(notificationButtonTitle, action: configureNotifications)
@@ -656,20 +665,25 @@ struct MenuContent: View {
 
 struct GoalHUD: View {
     static let side: CGFloat = 44
+    static let canvasWidth: CGFloat = 252
+    static let canvasHeight: CGFloat = 60
     @ObservedObject var model: ObserverModel
     private var hasJudgment: Bool { [.focused, .drifting, .distracted].contains(model.displayStatus) }
     private var foreground: Color { model.displayStatus == .drifting ? Color(red: 0.19, green: 0.13, blue: 0.02) : (hasJudgment ? .white : .primary) }
     var body: some View {
-        Image(systemName: "arrow.up.right")
-            .font(.system(size: 22, weight: .bold))
-            .foregroundStyle(foreground)
-            .frame(width: 40, height: 40)
-            .background {
-                if hasJudgment { Circle().fill(model.displayStatus.color) }
-                else { Circle().fill(.ultraThinMaterial) }
-            }
-            .overlay(Circle().strokeBorder(foreground.opacity(hasJudgment ? 0.2 : 0.08), lineWidth: 1))
-            .frame(width: Self.side, height: Self.side)
+        ZStack {
+            HUDGlow(status: model.displayStatus)
+            Image(systemName: "arrow.up.right")
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(foreground)
+                .frame(width: 40, height: 40)
+                .background {
+                    if hasJudgment { Circle().fill(model.displayStatus.color) }
+                    else { Circle().fill(.ultraThinMaterial) }
+                }
+                .overlay(Circle().strokeBorder(foreground.opacity(hasJudgment ? 0.2 : 0.08), lineWidth: 1))
+                .frame(width: Self.side, height: Self.side)
+        }.frame(width: Self.canvasWidth, height: Self.canvasHeight)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Onward. \(model.displayStatus.title). Goal: \(model.goal)")
             .accessibilityValue(model.isHoldingStatus ? "Showing the last established status" : "")

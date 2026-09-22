@@ -62,7 +62,7 @@ enum CommandLineTools {
                     print(String(decoding: data, as: UTF8.self))
                 } else { print(String(data: try AppStorage.encoder.encode(observation), encoding: .utf8)!) }
             case "--render-preview":
-                guard (2...6).contains(arguments.count) else { throw CLIError.message("Provide a PNG path, optional view (now/activity/settings/goals/review/learned/hud/glow), state, theme (light/dark), and dimensions (980x780).") }
+                guard (2...6).contains(arguments.count) else { throw CLIError.message("Provide a PNG path, optional view (now/activity/settings/goals/review/learned/camera/calibration/hud/glow), state, theme (light/dark), and dimensions (980x780).") }
                 let dimensions = arguments.count > 5 ? arguments[5].split(separator: "x").compactMap { Double($0) } : [980, 780]
                 guard dimensions.count == 2, dimensions[0] >= 860, dimensions[1] >= 690,
                       dimensions[0] <= 2000, dimensions[1] <= 2000 else { throw CLIError.message("Preview dimensions must be 860x690 through 2000x2000.") }
@@ -119,7 +119,19 @@ enum CommandLineTools {
             spend.record(receipt: JevSpendReceipt(responseData: Data(#"{"model":"jev-1.13.0","usage":{"input_tokens":184250}}"#.utf8)), at: Date())
             model.spendLedger = spend
         }
-        let size = surface == "hud" ? NSSize(width: GoalHUD.side, height: GoalHUD.side) : dimensions
+        if ["camera", "calibration"].contains(surface) {
+            let calibrating = surface == "calibration" && state != "complete"
+            model.setCameraPreviewFixture(frame: cameraPreviewFixture(), snapshot: CameraAttentionSnapshot(
+                status: calibrating ? .calibrating : (state == "looking-away" ? .lookingAway : .present),
+                reason: calibrating ? "Stable eyes detected. Keep looking at the target."
+                    : state == "looking-away" ? "Looking away from the calibrated screen position." : "Facing the calibrated screen position.",
+                calibrated: !calibrating, faceBounds: CGRect(x: 0.31, y: 0.23, width: 0.38, height: 0.56),
+                pupilPoints: [CGPoint(x: 0.42, y: 0.58), CGPoint(x: 0.58, y: 0.58)],
+                gazeOffset: calibrating ? nil : CGPoint(x: state == "looking-away" ? 0.8 : 0.08, y: 0.12),
+                calibrationProgress: calibrating ? 0.6 : 1, calibrationSecondsRemaining: calibrating ? 14 : nil))
+        }
+        let size = surface == "hud" ? NSSize(width: GoalHUD.canvasWidth, height: GoalHUD.canvasHeight)
+            : surface == "calibration" ? NSSize(width: 690, height: 580) : dimensions
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
         window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         window.isOpaque = surface != "hud"; window.backgroundColor = surface == "hud" ? .clear : .windowBackgroundColor
@@ -132,6 +144,8 @@ enum CommandLineTools {
         case "goals": root = AnyView(Dashboard(model: model, initialSelection: "Goals"))
         case "review": root = AnyView(Dashboard(model: model, initialSelection: "Review"))
         case "learned": root = AnyView(Dashboard(model: model, initialSelection: "Review", initialReviewSection: "Learned examples"))
+        case "camera": root = AnyView(Dashboard(model: model, initialSelection: "Camera"))
+        case "calibration": root = AnyView(CameraCalibrationView(model: model, automaticallyStart: false))
         case "now": root = AnyView(Dashboard(model: model))
         default: throw CLIError.message("Unknown preview view: \(surface)")
         }
@@ -166,6 +180,18 @@ enum CommandLineTools {
         guard let data = output.representation(using: .png, properties: [:]) else { throw CLIError.message("Could not encode preview image.") }
         try data.write(to: url, options: .atomic)
         print("Rendered \(surface), \(state), \(dark ? "dark" : "light"): \(url.path)")
+    }
+    @MainActor private static func cameraPreviewFixture() -> CGImage? {
+        let image = NSImage(size: NSSize(width: 640, height: 480))
+        image.lockFocus()
+        NSColor(white: 0.12, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: 640, height: 480).fill()
+        NSColor(white: 0.30, alpha: 1).setFill(); NSBezierPath(ovalIn: NSRect(x: 200, y: 110, width: 240, height: 270)).fill()
+        NSColor(white: 0.60, alpha: 1).setFill()
+        for x in [268.8, 371.2] { NSBezierPath(ovalIn: NSRect(x: x - 9, y: 278.4 - 9, width: 18, height: 18)).fill() }
+        ("Synthetic preview · no camera used" as NSString).draw(at: NSPoint(x: 18, y: 18),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 15), .foregroundColor: NSColor.white])
+        image.unlockFocus()
+        return image.cgImage(forProposedRect: nil, context: nil, hints: nil)
     }
     @MainActor private static func smoke() async throws {
         try smokeEdgeGlow()
@@ -260,7 +286,9 @@ enum CommandLineTools {
     @MainActor private static func smokeTimeCueTimer() async throws {
         // Exercise real run-loop timers without playing audio or changing preferences.
         var cues: [Date] = []
-        let controller = TimeCueController { cues.append(Date()) }
+        // A controlled session gate lets this silent check run while the Mac is locked.
+        var sessionAllowsCue = true
+        let controller = TimeCueController(sessionAllowsCue: { sessionAllowsCue }) { cues.append(Date()) }
         defer { controller.stop() }
         func waitPastNextBoundary() async throws {
             let boundary = TimeCueSchedule.nextBoundary(after: Date(), interval: .fiveSeconds)
@@ -275,6 +303,10 @@ enum CommandLineTools {
         controller.setSuspended(false)
         try await waitPastNextBoundary()
         guard cues.count == 2 else { throw CLIError.message("Time cue did not resume at the next clock boundary.") }
+        sessionAllowsCue = false
+        try await waitPastNextBoundary()
+        guard cues.count == 2 else { throw CLIError.message("Time cue fired while the session gate was closed.") }
+        sessionAllowsCue = true
         controller.configure(enabled: false, interval: .fiveSeconds)
         try await waitPastNextBoundary()
         guard cues.count == 2 else { throw CLIError.message("Disabled time cue fired.") }
@@ -282,7 +314,7 @@ enum CommandLineTools {
         guard lateness.allSatisfy({ $0 >= 0 && $0 <= 0.5 }) else {
             throw CLIError.message("Native time cue drifted from clock boundaries.")
         }
-        print("PASS native time cues: aligned callbacks, suspend/resume, disable; max lateness \(Int((lateness.max() ?? 0) * 1000))ms (silent)")
+        print("PASS native time cues: aligned callbacks, suspend/resume, session gate, disable; max lateness \(Int((lateness.max() ?? 0) * 1000))ms (silent)")
     }
     @MainActor private static func smokeEdgeGlow() throws {
         let size = NSSize(width: 400, height: 400)
@@ -332,18 +364,26 @@ enum CommandLineTools {
         view.update(status: .focused)
         view.playRecoveryPulse()
         view.update(status: .focused)
-        guard view.animationDiagnostics.recoveryPulse,
-              view.animationDiagnostics.recoveryParticles == ((!options.reduceMotion && !options.reduceTransparency) ? 8 : 0) else {
-            throw CLIError.message("Recovery effect did not retain its pulse and appropriate particles.")
+        let recovery = view.animationDiagnostics
+        let fullMotion = !options.reduceMotion && !options.reduceTransparency
+        guard recovery.recoveryPulse, recovery.recoveryDuration == 3,
+              recovery.recoveryParticles == (fullMotion ? 24 : 0),
+              recovery.recoverySparkles == (fullMotion ? 18 : 0),
+              recovery.recoveryWaves == (fullMotion ? 2 : 0) else {
+            throw CLIError.message("Recovery effect did not retain its three-second pulse and appropriate effects.")
         }
+        view.frame.size = NSSize(width: 900, height: 600)
+        guard !view.animationDiagnostics.recoveryPulse else { throw CLIError.message("Recovery effect survived a display resize.") }
+        view.playRecoveryPulse()
         view.update(status: .drifting)
         guard !view.animationDiagnostics.recoveryPulse else { throw CLIError.message("Recovery effect survived a warning transition.") }
         view.stopAnimating()
         let stopped = view.animationDiagnostics
-        guard !stopped.movingHighlight, !stopped.warningPulse, !stopped.recoveryPulse, stopped.recoveryParticles == 0 else {
+        guard !stopped.movingHighlight, !stopped.warningPulse, !stopped.recoveryPulse,
+              stopped.recoveryParticles == 0, stopped.recoverySparkles == 0, stopped.recoveryWaves == 0 else {
             throw CLIError.message("Glow effects did not stop cleanly.")
         }
-        print("PASS animated glow: movement, warning pulse, recovery particles, stable updates and cleanup (offscreen)")
+        print("PASS animated glow: movement, warning pulse, three-second recovery, 24 plus signs, 18 sparkles, two waves, accessibility gates and cleanup (offscreen)")
     }
     @MainActor private static func smokeGoalReview() throws {
         let model = ObserverModel(audioEnabled: false, persistenceEnabled: false)

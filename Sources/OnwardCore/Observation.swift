@@ -128,6 +128,16 @@ public struct FocusPolicy: Sendable {
         guard offGoalSince != nil, uncertaintyStartedAt == nil else { return }
         uncertaintyStartedAt = now
     }
+    /// Resumes after the caller verifies the same surface against still-fresh evidence.
+    /// Explicit uncertainty requires a new decisive judgment and cannot resume here.
+    public mutating func resume(at now: Date) {
+        guard alignment == .offGoal, heldStatus == nil,
+              let pausedAt = uncertaintyStartedAt, let last = lastJudgmentAt,
+              now >= pausedAt, now >= last,
+              now.timeIntervalSince(last) <= maximumEvidenceAge else { return }
+        uncertainDuration += now.timeIntervalSince(pausedAt)
+        uncertaintyStartedAt = nil
+    }
     private mutating func accept(alignment nextAlignment: Alignment, at now: Date) {
         // A stale gap must never count as confirmed distraction.
         if let last = lastJudgmentAt, now.timeIntervalSince(last) > maximumEvidenceAge { reset() }

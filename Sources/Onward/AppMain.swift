@@ -32,7 +32,7 @@ import Darwin
     }
 }
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     private var model: ObserverModel!
     private var window: NSWindow!
     private var item: NSStatusItem!
@@ -56,6 +56,7 @@ import Darwin
         UNUserNotificationCenter.current().delegate = self
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 780), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = "Onward"; window.titlebarAppearsTransparent = true; window.titleVisibility = .hidden
+        window.delegate = self
         window.isReleasedWhenClosed = false; window.setFrameAutosaveName("OnwardMain")
         window.contentView = NSHostingView(rootView: Dashboard(model: model))
         window.center()
@@ -63,7 +64,7 @@ import Darwin
         item.button?.target = self; item.button?.action = #selector(togglePopover)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: MenuContent(model: model, open: { [weak self] in self?.openWindow() }))
-        hud = NSPanel(contentRect: NSRect(x: 0, y: 0, width: GoalHUD.side, height: GoalHUD.side), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        hud = NSPanel(contentRect: NSRect(x: 0, y: 0, width: GoalHUD.canvasWidth, height: GoalHUD.canvasHeight), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         hud.isOpaque = false; hud.backgroundColor = .clear; hud.hasShadow = true
         // Even between pointer samples, tabs behind the pill must receive clicks.
         hud.ignoresMouseEvents = true
@@ -82,6 +83,11 @@ import Darwin
         if showWindowOnLaunch { openWindow() }
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { openWindow(); return true }
+    func applicationDidBecomeActive(_ notification: Notification) { updateCameraPreviewVisibility() }
+    func applicationDidResignActive(_ notification: Notification) { model?.setCameraPreviewVisible(false) }
+    func windowWillClose(_ notification: Notification) { model?.setCameraPreviewVisible(false) }
+    func windowDidMiniaturize(_ notification: Notification) { model?.setCameraPreviewVisible(false) }
+    func windowDidDeminiaturize(_ notification: Notification) { updateCameraPreviewVisibility() }
     func applicationWillTerminate(_ notification: Notification) { hoverTimer?.invalidate(); screenGlow.stop(); model?.stop(); hud?.close() }
     private func installMenus() {
         let menu = NSMenu()
@@ -113,13 +119,21 @@ import Darwin
         ])
         NSApp.mainMenu = menu
     }
-    func openWindow() { popover.performClose(nil); NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil) }
+    func openWindow() {
+        popover.performClose(nil); NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil)
+        updateCameraPreviewVisibility()
+    }
+    private func updateCameraPreviewVisibility() {
+        guard let window, let model else { return }
+        model.setCameraPreviewVisible(NSApp.isActive && window.isVisible && !window.isMiniaturized)
+    }
     @objc private func togglePopover() {
         if popover.isShown { popover.performClose(nil) }
         else if let button = item.button { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY); NSApp.activate(ignoringOtherApps: true) }
     }
     private func updateChrome() {
         guard model != nil else { return }
+        updateCameraPreviewVisibility()
         let image = NSImage(systemSymbolName: "arrow.up.right.circle.fill", accessibilityDescription: "Onward. \(model.displayStatus.title)")
         item.button?.image = image; item.button?.contentTintColor = NSColor(model.displayStatus.color)
         item.button?.title = ""
@@ -138,7 +152,8 @@ import Darwin
             let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main
             if let screen {
                 let top = max(screen.safeAreaInsets.top, screen.frame.maxY - screen.visibleFrame.maxY)
-                hud.setFrameOrigin(NSPoint(x: screen.frame.midX - GoalHUD.side / 2, y: screen.frame.maxY - top - GoalHUD.side - 7))
+                hud.setFrameOrigin(NSPoint(x: screen.frame.midX - GoalHUD.canvasWidth / 2,
+                                           y: screen.frame.maxY - top - GoalHUD.canvasHeight - 7))
             }
         }
         updateHUDVisibility()

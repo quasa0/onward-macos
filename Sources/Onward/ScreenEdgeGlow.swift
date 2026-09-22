@@ -143,12 +143,15 @@ import OnwardCore
 /// Reusable transparent renderer. animated:false gives a static peak-opacity QA image.
 /// The backing field is static; Core Animation moves a small masked highlight.
 @MainActor final class ScreenEdgeGlowView: NSView {
-    static let recoveryDuration: TimeInterval = 1.05
+    static let recoveryDuration: TimeInterval = 3
     struct AnimationDiagnostics {
         let movingHighlight: Bool
         let warningPulse: Bool
         let recoveryPulse: Bool
         let recoveryParticles: Int
+        let recoverySparkles: Int
+        let recoveryWaves: Int
+        let recoveryDuration: TimeInterval
         let reduceMotion: Bool
         let reduceTransparency: Bool
     }
@@ -180,6 +183,9 @@ import OnwardCore
             warningPulse: warningPulse?.animation(forKey: pulseKey) != nil,
             recoveryPulse: recoveryPulse?.animation(forKey: pulseKey) != nil,
             recoveryParticles: recoveryPulse?.sublayers?.filter { $0.name == "recovery.plus" }.count ?? 0,
+            recoverySparkles: recoveryPulse?.sublayers?.filter { $0.name == "recovery.sparkle" }.count ?? 0,
+            recoveryWaves: recoveryPulse?.sublayers?.filter { $0.name == "recovery.wave" }.count ?? 0,
+            recoveryDuration: recoveryPulse?.animation(forKey: pulseKey)?.duration ?? 0,
             reduceMotion: glowAppearance?.reduceMotion ?? false,
             reduceTransparency: glowAppearance?.reduceTransparency ?? false)
     }
@@ -233,6 +239,7 @@ import OnwardCore
     }
 
     override func setFrameSize(_ newSize: NSSize) {
+        if newSize != frame.size { cancelRecoveryPulse() }
         super.setFrameSize(newSize)
         needsDisplay = true
         rebuildMovingHighlight()
@@ -250,14 +257,30 @@ import OnwardCore
     func playRecoveryPulse() {
         guard glowAppearance?.status == .focused, glowAppearance?.animated == true else { return }
         cancelRecoveryPulse()
-        let color = NSColor(srgbRed: 0.16, green: 0.94, blue: 0.73, alpha: 1)
-        let pulse = edgeField(color: color, reach: 30, alpha: 0.34)
+        let mint = NSColor(srgbRed: 0.24, green: 1, blue: 0.65, alpha: 1)
+        let aqua = NSColor(srgbRed: 0.12, green: 0.88, blue: 0.94, alpha: 1)
+        let pulse = CALayer(); pulse.frame = bounds; pulse.opacity = 0; pulse.masksToBounds = true
         recoveryPulse = pulse
         layer?.addSublayer(pulse)
+        let base = edgeField(color: mint, reach: 34, alpha: 0.32)
+        base.opacity = 1; pulse.addSublayer(base)
         if glowAppearance?.reduceMotion == false, glowAppearance?.reduceTransparency == false {
-            addRecoveryParticles(to: pulse, color: color)
+            for index in 0..<2 {
+                let wave = edgeField(color: index == 0 ? aqua : mint, reach: index == 0 ? 46 : 38, alpha: 0.18)
+                wave.name = "recovery.wave"; pulse.addSublayer(wave)
+                animatePulse(wave, duration: 1.65, delay: Double(index) * 0.85)
+            }
+            addRecoveryParticles(to: pulse, mint: mint, aqua: aqua)
         }
-        animatePulse(pulse, duration: Self.recoveryDuration)
+        // Hold enough light for both particle waves, then let the whole effect settle.
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [0, 1, 0.86, 0.72, 0]
+        fade.keyTimes = [0, 0.07, 0.40, 0.72, 1]
+        fade.duration = Self.recoveryDuration
+        fade.timingFunctions = [CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1),
+                                CAMediaTimingFunction(name: .linear), CAMediaTimingFunction(name: .linear),
+                                CAMediaTimingFunction(name: .easeOut)]
+        pulse.add(fade, forKey: pulseKey)
     }
 
     func cancelRecoveryPulse() {
@@ -319,46 +342,77 @@ import OnwardCore
         return field
     }
 
-    private func animatePulse(_ pulse: CALayer, duration: TimeInterval) {
+    private func animatePulse(_ pulse: CALayer, duration: TimeInterval, delay: TimeInterval = 0) {
         let fade = CAKeyframeAnimation(keyPath: "opacity")
         fade.values = [0, 1, 0.65, 0]
         fade.keyTimes = [0, 0.12, 0.38, 1]
         fade.duration = duration
+        fade.beginTime = pulse.convertTime(CACurrentMediaTime(), from: nil) + delay
         fade.timingFunctions = [CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1),
                                 CAMediaTimingFunction(name: .linear), CAMediaTimingFunction(name: .easeOut)]
         pulse.add(fade, forKey: pulseKey)
     }
 
-    private func addRecoveryParticles(to field: CALayer, color: NSColor) {
-        for index in 0..<8 {
+    private func addRecoveryParticles(to field: CALayer, mint: NSColor, aqua: NSColor) {
+        let start = field.convertTime(CACurrentMediaTime(), from: nil)
+        for index in 0..<24 {
+            let wave = index / 12, column = index % 12
             let particle = CAShapeLayer(); particle.name = "recovery.plus"
-            let size: CGFloat = index.isMultiple(of: 3) ? 8 : 6
+            let size: CGFloat = index.isMultiple(of: 3) ? 13 : 9
             particle.bounds = CGRect(x: 0, y: 0, width: size, height: size)
-            particle.position = CGPoint(x: bounds.width * (0.15 + CGFloat(index) * 0.10), y: 10)
+            particle.position = CGPoint(x: bounds.width * (0.06 + CGFloat(column) * 0.078 + CGFloat(wave) * 0.018), y: 10)
             let path = CGMutablePath()
             path.move(to: CGPoint(x: size / 2, y: 0)); path.addLine(to: CGPoint(x: size / 2, y: size))
             path.move(to: CGPoint(x: 0, y: size / 2)); path.addLine(to: CGPoint(x: size, y: size / 2))
+            let color = index.isMultiple(of: 2) ? mint : aqua
             particle.path = path; particle.strokeColor = color.cgColor; particle.fillColor = nil
-            particle.lineWidth = 1.5; particle.lineCap = .round; particle.opacity = 0
-            let rise = CABasicAnimation(keyPath: "transform.translation.y")
-            rise.fromValue = 0; rise.toValue = 34 + index % 3 * 7
-            rise.duration = 0.82
-            rise.timingFunction = CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
+            particle.lineWidth = 2; particle.lineCap = .round; particle.opacity = 0
+            particle.shadowColor = color.cgColor; particle.shadowRadius = 3; particle.shadowOpacity = 0.35
+            particle.shadowOffset = .zero
+            let rise = CAKeyframeAnimation(keyPath: "transform.translation")
+            let drift: CGFloat = index.isMultiple(of: 2) ? -14 : 14
+            let height = min(bounds.height * 0.24, CGFloat(82 + (index % 4) * 18))
+            rise.values = [NSValue(size: .zero), NSValue(size: NSSize(width: drift * 0.5, height: height * 0.64)),
+                           NSValue(size: NSSize(width: drift, height: height))]
+            rise.keyTimes = [0, 0.55, 1]
+            rise.duration = 1.8
+            rise.timingFunctions = [CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1), CAMediaTimingFunction(name: .easeOut)]
+            let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+            scale.values = [0.9, 1.12, 1]; scale.keyTimes = [0, 0.22, 1]; scale.duration = 1.8
             let fade = CAKeyframeAnimation(keyPath: "opacity")
-            fade.values = [0, 0.85, 0.55, 0]; fade.keyTimes = [0, 0.18, 0.55, 1]
-            fade.duration = 0.82
-            let animation = CAAnimationGroup(); animation.animations = [rise, fade]
-            animation.duration = 0.82
-            animation.beginTime = CACurrentMediaTime() + Double(index) * 0.025
+            fade.values = [0, 0.95, 0.75, 0]; fade.keyTimes = [0, 0.14, 0.60, 1]; fade.duration = 1.8
+            let animation = CAAnimationGroup(); animation.animations = [rise, scale, fade]
+            animation.duration = 1.8
+            animation.beginTime = start + 0.08 + Double(wave) * 0.8 + Double(column) * 0.025
             field.addSublayer(particle)
             particle.add(animation, forKey: pulseKey)
+        }
+        for index in 0..<18 {
+            let sparkle = CAShapeLayer(); sparkle.name = "recovery.sparkle"
+            let size: CGFloat = index.isMultiple(of: 3) ? 6 : 4
+            sparkle.bounds = CGRect(x: 0, y: 0, width: size, height: size)
+            let left = index.isMultiple(of: 2)
+            sparkle.position = CGPoint(x: left ? 14 : bounds.width - 14,
+                                       y: bounds.height * (0.08 + CGFloat(index / 2) * 0.09))
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: size / 2, y: 0)); path.addLine(to: CGPoint(x: size, y: size / 2))
+            path.addLine(to: CGPoint(x: size / 2, y: size)); path.addLine(to: CGPoint(x: 0, y: size / 2)); path.closeSubpath()
+            sparkle.path = path; sparkle.fillColor = (left ? aqua : mint).cgColor; sparkle.opacity = 0
+            let rise = CABasicAnimation(keyPath: "transform.translation.y")
+            rise.fromValue = 0; rise.toValue = 36 + index % 3 * 10; rise.duration = 1.5
+            rise.timingFunction = CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
+            let fade = CAKeyframeAnimation(keyPath: "opacity")
+            fade.values = [0, 0.8, 0.4, 0]; fade.keyTimes = [0, 0.2, 0.65, 1]; fade.duration = 1.5
+            let animation = CAAnimationGroup(); animation.animations = [rise, fade]
+            animation.duration = 1.5; animation.beginTime = start + 0.12 + Double(index) * 0.065
+            field.addSublayer(sparkle); sparkle.add(animation, forKey: pulseKey)
         }
     }
 
     private func removeEffect(_ effect: CALayer?) {
         guard let effect else { return }
         effect.removeAllAnimations()
-        for child in effect.sublayers ?? [] { child.removeAllAnimations() }
+        for child in effect.sublayers ?? [] { removeEffect(child) }
         effect.removeFromSuperlayer()
     }
 

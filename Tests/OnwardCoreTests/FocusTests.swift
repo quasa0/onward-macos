@@ -182,6 +182,50 @@ final class FocusTests: XCTestCase {
         XCTAssertNil(policy.offGoalSince)
         XCTAssertEqual(policy.alignment, .unclear)
     }
+    func testVerifiedCheckingCompletionResumesFreshJudgmentWithoutRefreshingIt() {
+        var policy = FocusPolicy(); policy.redAfter = 30
+        policy.accept(judgment(.offGoal), at: epoch)
+        policy.suspend(at: epoch.addingTimeInterval(5))
+        policy.resume(at: epoch.addingTimeInterval(7))
+        policy.resume(at: epoch.addingTimeInterval(12))
+        XCTAssertEqual(policy.lastJudgmentAt, epoch)
+        XCTAssertEqual(policy.alignment, .offGoal)
+        XCTAssertEqual(policy.offGoalDuration(at: epoch.addingTimeInterval(20)), 18)
+        policy.accept(judgment(.offGoal), at: epoch.addingTimeInterval(20))
+        policy.suspend(at: epoch.addingTimeInterval(22))
+        policy.resume(at: epoch.addingTimeInterval(24))
+        XCTAssertEqual(policy.lastJudgmentAt, epoch.addingTimeInterval(20))
+        XCTAssertEqual(policy.status(at: epoch.addingTimeInterval(33)), .drifting)
+        XCTAssertEqual(policy.offGoalDuration(at: epoch.addingTimeInterval(34)), 30)
+        XCTAssertEqual(policy.status(at: epoch.addingTimeInterval(34)), .distracted)
+    }
+    func testVerifiedSurfaceCannotResumeExplicitUncertainty() {
+        var policy = FocusPolicy()
+        policy.accept(judgment(.offGoal), at: epoch)
+        policy.suspend(at: epoch.addingTimeInterval(5))
+        policy.acceptUncertainty(at: epoch.addingTimeInterval(7))
+        policy.resume(at: epoch.addingTimeInterval(10))
+        policy.acceptUncertainty(at: epoch.addingTimeInterval(25))
+        policy.resume(at: epoch.addingTimeInterval(26))
+        XCTAssertEqual(policy.lastJudgmentAt, epoch.addingTimeInterval(25))
+        XCTAssertEqual(policy.alignment, .unclear)
+        XCTAssertTrue(policy.isHoldingStatus)
+        XCTAssertEqual(policy.offGoalDuration(at: epoch.addingTimeInterval(30)), 5)
+        policy.accept(judgment(.offGoal), at: epoch.addingTimeInterval(35))
+        XCTAssertEqual(policy.offGoalDuration(at: epoch.addingTimeInterval(36)), 6)
+    }
+    func testVerifiedSurfaceCannotResumeStaleJudgmentOrCarryItsPausedTime() {
+        var policy = FocusPolicy()
+        policy.accept(judgment(.offGoal), at: epoch)
+        policy.suspend(at: epoch.addingTimeInterval(20))
+        policy.resume(at: epoch.addingTimeInterval(31))
+        XCTAssertEqual(policy.lastJudgmentAt, epoch)
+        XCTAssertEqual(policy.status(at: epoch.addingTimeInterval(31)), .observing)
+        XCTAssertEqual(policy.offGoalDuration(at: epoch.addingTimeInterval(31)), 0)
+        policy.accept(judgment(.offGoal), at: epoch.addingTimeInterval(40))
+        XCTAssertEqual(policy.offGoalSince, epoch.addingTimeInterval(40))
+        XCTAssertEqual(policy.offGoalDuration(at: epoch.addingTimeInterval(41)), 1)
+    }
     func testNearlyFlatProbabilitiesStillHonorTheSelectedCategory() {
         let expected: [Alignment: FocusStatus] = [.onGoal: .focused, .supporting: .focused,
                                                   .offGoal: .drifting, .unclear: .unclear]

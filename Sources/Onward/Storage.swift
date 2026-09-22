@@ -47,6 +47,8 @@ enum Credentials {
 }
 
 final class JevClient: NSObject, URLSessionTaskDelegate {
+    var onSpendRecorded: (@MainActor (JevSpendLedger?, String?) -> Void)?
+    private let spendStore = JevSpendFileStore(url: AppStorage.directory.appendingPathComponent("jev-spend.json"))
     // Keep credentials on the documented host even if an upstream response redirects.
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
     lazy var session: URLSession = {
@@ -65,9 +67,28 @@ final class JevClient: NSObject, URLSessionTaskDelegate {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = payload
         let start = Date()
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do { (data, response) = try await session.data(for: request) }
+        catch {
+            await recordSpend(responseData: nil)
+            throw error
+        }
         guard let response = response as? HTTPURLResponse else { throw JevError.invalidResponse }
+        // Account for returned usage before answer validation or foreground staleness checks.
+        // A request can cost money even when its judgment is no longer usable.
+        if response.statusCode == 200 { await recordSpend(responseData: data) }
         guard response.statusCode == 200 else { throw JevError.http(response.statusCode) }
         return try JevContract.parse(data, latencyMilliseconds: Int(Date().timeIntervalSince(start) * 1000))
+    }
+    private func recordSpend(responseData: Data?) async {
+        do {
+            let ledger: JevSpendLedger
+            if let responseData { ledger = try spendStore.record(receipt: JevSpendReceipt(responseData: responseData), at: Date()) }
+            else { ledger = try spendStore.recordUnreported(at: Date()) }
+            await onSpendRecorded?(ledger, nil)
+        } catch {
+            await onSpendRecorded?(nil, "Jev usage could not be saved. The spend estimate may be incomplete.")
+        }
     }
 }

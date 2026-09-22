@@ -122,6 +122,7 @@ public struct FocusPolicy: Sendable {
     public mutating func acceptUncertainty(at now: Date) {
         accept(alignment: .unclear, at: now)
     }
+    public mutating func acceptOffGoal(at now: Date) { accept(alignment: .offGoal, at: now) }
     /// Pauses elapsed distraction during checking without treating it as new evidence.
     public mutating func suspend(at now: Date) {
         guard offGoalSince != nil, uncertaintyStartedAt == nil else { return }
@@ -173,10 +174,11 @@ public struct ActivityEntry: Codable, Identifiable, Sendable {
     public var id = UUID()
     public var date = Date()
     public var goal: String
+    public var goalID: UUID?
     public var observation: Observation
     public var judgment: Judgment?
     public var correction: Alignment?
-    public init(goal: String, observation: Observation, judgment: Judgment? = nil, correction: Alignment? = nil) {
-        self.goal = goal; self.observation = observation; self.judgment = judgment; self.correction = correction
+    public init(goal: String, observation: Observation, judgment: Judgment? = nil, correction: Alignment? = nil, goalID: UUID? = nil) {
+        self.goal = goal; self.goalID = goalID; self.observation = observation; self.judgment = judgment; self.correction = correction
     }
 }

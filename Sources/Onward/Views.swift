@@ -38,7 +38,7 @@ struct Card<Content: View>: View {
     }
 }
 
-private struct InlineNotice: View {
+struct InlineNotice: View {
     let message: String
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -55,10 +55,13 @@ struct Dashboard: View {
     @State private var goalDraft = ""
     @State private var contextDraft = ""
     @State private var inspect = false
+    @State private var correctionMessage: String?
+    @State private var reviewSection = "To review"
 
-    init(model: ObserverModel, initialSelection: String = "Now") {
+    init(model: ObserverModel, initialSelection: String = "Now", initialReviewSection: String = "To review") {
         self.model = model
         _selection = State(initialValue: initialSelection)
+        _reviewSection = State(initialValue: initialReviewSection)
         _goalDraft = State(initialValue: model.goal)
         _contextDraft = State(initialValue: model.context)
     }
@@ -70,6 +73,8 @@ struct Dashboard: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     if selection == "Now" { nowView }
+                    else if selection == "Goals" { GoalsView(model: model) }
+                    else if selection == "Review" { ReviewView(model: model, initialSection: reviewSection) }
                     else if selection == "Activity" { activityView }
                     else { SettingsView(model: model) }
                 }.padding(32).frame(maxWidth: 800, alignment: .leading).frame(maxWidth: .infinity)
@@ -77,8 +82,16 @@ struct Dashboard: View {
         }.frame(minWidth: 860, minHeight: 690)
             .tint(accent)
             .onAppear { goalDraft = model.goal; contextDraft = model.context }
-            .onChange(of: model.goal) { _, value in goalDraft = value }
+            .onChange(of: model.goal) { _, value in goalDraft = value; correctionMessage = nil }
             .onChange(of: model.context) { _, value in contextDraft = value }
+            .onChange(of: model.observation?.id) { _, _ in correctionMessage = nil }
+            .onChange(of: model.goalLibrary.activeGoalID) { _, _ in correctionMessage = nil }
+            .onReceive(NotificationCenter.default.publisher(for: .onwardNavigate)) { notification in
+                if let destination = notification.object as? String {
+                    if destination == "Review" { openReview() }
+                    else { selection = destination }
+                }
+            }
             .sheet(isPresented: $inspect) { EvidenceView(model: model) }
     }
 
@@ -90,6 +103,15 @@ struct Dashboard: View {
             }.padding(.horizontal, 20).padding(.top, 28)
             List(selection: Binding<String?>(get: { selection }, set: { if let value = $0 { selection = value } })) {
                 Label("Now", systemImage: "scope").tag("Now")
+                Label("Goals", systemImage: "flag").tag("Goals")
+                HStack {
+                    Label("Review", systemImage: "checklist")
+                    Spacer()
+                    if model.pendingReviewCount > 0 {
+                        Text(model.pendingReviewCount.formatted()).font(.system(size: 11, weight: .medium)).monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }.tag("Review")
                 Label("Activity", systemImage: "clock.arrow.circlepath").tag("Activity")
                 Label("Settings", systemImage: "slider.horizontal.3").tag("Settings")
             }.listStyle(.sidebar).scrollContentBackground(.hidden).font(.system(size: 13))
@@ -98,6 +120,10 @@ struct Dashboard: View {
                     .font(.system(size: 12, weight: .medium))
                 Text(model.isRunning ? "Session \(model.sessionDuration)" : "Ready when you are")
                     .font(.system(size: 12)).monospacedDigit().foregroundStyle(muted)
+                Divider().padding(.vertical, 7)
+                Text("Jev today · estimated").font(.system(size: 11)).foregroundStyle(muted)
+                Text("\(JevSpendFormat.usd(nanodollars: model.todaySpend.estimatedNanodollars)) USD")
+                    .font(.system(size: 14, weight: .medium)).monospacedDigit()
             }.padding(20)
         }.frame(width: 185).background(colorScheme == .dark ? Color(white: 0.12) : Color(white: 0.965))
     }
@@ -117,7 +143,11 @@ struct Dashboard: View {
             Card {
                 VStack(alignment: .leading, spacing: 18) {
                     VStack(alignment: .leading, spacing: 9) {
-                        Text("Your goal").font(.system(size: 13, weight: .semibold))
+                        HStack {
+                            Text("Your goal").font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            SavedGoalSwitcher(model: model) { selection = "Goals" }
+                        }
                         TextField("What do you want to make progress on?", text: $goalDraft, axis: .vertical)
                             .textFieldStyle(.plain).font(.system(size: 21, weight: .medium)).lineLimit(2...4)
                             .accessibilityLabel("Your goal")
@@ -154,6 +184,22 @@ struct Dashboard: View {
                 }
             }
             if let error = model.error { InlineNotice(message: error) }
+            if let error = model.knowledgeError { InlineNotice(message: error) }
+            if model.pendingReviewCount > 0 {
+                Button { openReview() } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "checklist").font(.system(size: 17)).foregroundStyle(accent)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Teach Onward what belongs").font(.system(size: 13, weight: .semibold))
+                            Text("\(model.pendingReviewCount) \(model.pendingReviewCount == 1 ? "activity" : "activities") to review for this goal")
+                                .font(.system(size: 12)).foregroundStyle(muted)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold)).foregroundStyle(muted)
+                    }.padding(14).contentShape(RoundedRectangle(cornerRadius: 8))
+                }.buttonStyle(.plain)
+                    .background(accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+            }
             Divider()
             observationView
         }
@@ -202,12 +248,20 @@ struct Dashboard: View {
                             Text("\(Int(judgment.probability * 100))% probability").foregroundStyle(muted).monospacedDigit()
                         }.font(.system(size: 13))
                         HStack(spacing: 10) {
-                            Text("Correct Jev").font(.system(size: 12)).foregroundStyle(muted)
+                            Text("Teach this goal").font(.system(size: 12)).foregroundStyle(muted)
                             Spacer()
-                            Button("This is relevant") { model.correct(.onGoal) }
-                            Button("It's a distraction") { model.correct(.offGoal) }
+                            Button("Relevant", systemImage: "checkmark") { correctCurrentActivity(.onGoal) }
+                            Button("Irrelevant", systemImage: "xmark") { correctCurrentActivity(.offGoal) }
                         }.controlSize(.small)
+                        Button("Review examples and add notes") { openReview() }
+                            .buttonStyle(.link).font(.system(size: 12))
                     }.padding(.top, 2)
+                }
+                if let correctionMessage {
+                    Label(correctionMessage, systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 12)).foregroundStyle(accent)
+                    Button("Edit this example in Review") { openReview(learned: true) }
+                        .buttonStyle(.link).font(.system(size: 12))
                 }
             } else {
                 Text("Start a focus session, then use your Mac. Your current app and captured text will appear here.")
@@ -217,7 +271,20 @@ struct Dashboard: View {
         }
     }
 
+    private func correctCurrentActivity(_ alignment: OnwardCore.Alignment) {
+        model.correct(alignment)
+        if model.knowledgeError == nil {
+            correctionMessage = "Saved as \(alignment == .onGoal ? "relevant" : "irrelevant") for \(model.activeSavedGoal?.title ?? "this goal")."
+        }
+    }
+
+    private func openReview(learned: Bool = false) {
+        reviewSection = learned ? "Learned examples" : "To review"
+        selection = "Review"
+    }
+
     private var statusDetail: String {
+        if let reason = model.cameraDistractionReason { return reason }
         if model.isHoldingStatus && model.isRunning && ![.idle, .unavailable].contains(model.status) {
             return "Keeping your last status while waiting for a clear judgment. The distraction timer is paused."
         }
@@ -350,6 +417,8 @@ struct SettingsView: View {
                     .font(.system(size: 12)).monospacedDigit().foregroundStyle(muted)
             }
             Divider()
+            JevSpendView(model: model)
+            Divider()
             SettingsSection(title: "Capture") {
                 VStack(alignment: .leading, spacing: 6) {
                     SettingsToggle(title: "Local OCR with Apple Vision", isOn: $model.ocrEnabled)
@@ -369,6 +438,8 @@ struct SettingsView: View {
                 }
             }
             Divider()
+            CameraAttentionSettingsView(model: model)
+            Divider()
             SettingsSection(title: "Reminders") {
                 VStack(alignment: .leading, spacing: 6) {
                     SettingsToggle(title: "Show Onward below the notch", isOn: $model.showHUD)
@@ -376,10 +447,14 @@ struct SettingsView: View {
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     SettingsToggle(title: "Show screen-edge glow", isOn: $model.showScreenGlow)
-                    Text("A slight yellow glow when you drift. A wider red glow when distraction continues.")
+                    Text("A slight moving yellow glow when you drift. Red pulses with warnings. Returning to your goal gives a brief aqua-green pulse with rising plus signs.")
                         .font(.system(size: 12)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
                 }
-                SettingsToggle(title: "Play a sound when attention turns red", isOn: $model.soundEnabled)
+                VStack(alignment: .leading, spacing: 6) {
+                    SettingsToggle(title: "Play a sound while distracted", isOn: $model.soundEnabled)
+                    Text("At the start of red, then every 30 seconds while distraction continues.")
+                        .font(.system(size: 12)).foregroundStyle(muted)
+                }
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 10) {
                         Text("Warning sound")
@@ -535,7 +610,11 @@ struct MenuContent: View {
                 Spacer()
             }
             VStack(alignment: .leading, spacing: 7) {
-                Text("Your goal").font(.system(size: 12, weight: .medium)).foregroundStyle(muted)
+                HStack {
+                    Text("Your goal").font(.system(size: 12, weight: .medium)).foregroundStyle(muted)
+                    Spacer()
+                    SavedGoalSwitcher(model: model) { navigate("Goals") }
+                }
                 TextField("Set one goal to get started", text: $goalDraft, axis: .vertical)
                     .textFieldStyle(.plain).font(.system(size: 15, weight: .medium)).lineLimit(1...4)
                     .accessibilityLabel("Your goal")
@@ -544,6 +623,15 @@ struct MenuContent: View {
             if let observation = model.observation {
                 Text(observation.summary).font(.system(size: 12)).foregroundStyle(muted).lineLimit(2)
             }
+            if model.pendingReviewCount > 0 {
+                Button("Review activity (\(model.pendingReviewCount))", systemImage: "checklist") { navigate("Review") }
+                    .font(.system(size: 12))
+            }
+            HStack {
+                Text("Jev today · estimated").foregroundStyle(muted)
+                Spacer()
+                Text("\(JevSpendFormat.usd(nanodollars: model.todaySpend.estimatedNanodollars)) USD").monospacedDigit()
+            }.font(.system(size: 11))
             Divider()
             HStack {
                 Button("Open Onward", action: open)
@@ -559,6 +647,10 @@ struct MenuContent: View {
         }.padding(20).frame(width: 320)
             .onAppear { goalDraft = model.goal }
             .onChange(of: model.goal) { _, value in goalDraft = value }
+    }
+    private func navigate(_ destination: String) {
+        open()
+        NotificationCenter.default.post(name: .onwardNavigate, object: destination)
     }
 }
 
@@ -584,7 +676,7 @@ struct GoalHUD: View {
     }
 }
 
-private func appIcon(_ bundle: String) -> some View {
+func appIcon(_ bundle: String) -> some View {
     Group {
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) { Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable() }
         else { Image(systemName: "app").resizable().foregroundStyle(.secondary) }

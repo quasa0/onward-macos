@@ -33,6 +33,15 @@ import OnwardCore
     @Published var hasKey = false
     @Published var requestCount = 0
     @Published var inputTokens = 0
+    @Published var spendLedger = JevSpendLedger()
+    @Published var spendError: String?
+    @Published var goalLibrary = GoalLibrary()
+    @Published var knowledgeError: String?
+    @Published private(set) var warningPulseID = 0
+    @Published private(set) var recoveryPulseID = 0
+    @Published private(set) var cameraEnabled = UserDefaults.standard.bool(forKey: "cameraAttentionEnabled")
+    @Published private(set) var cameraPermissionPending = false
+    @Published private(set) var cameraSnapshot = CameraAttentionSnapshot(status: .disabled)
     @Published private(set) var lastRequestData: Data?
     @Published var startedAt: Date?
     @Published var now = Date()
@@ -67,6 +76,12 @@ import OnwardCore
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     private var apiKey = ""
     private let client = JevClient()
+    private var goalStore: GoalLibraryFileStore?
+    private var spendStore: JevSpendFileStore?
+    private var lastSpendRead = Date.distantPast
+    private var cameraController: CameraAttentionController?
+    private var cameraPermissionTask: Task<Void, Never>?
+    private var cameraOverrideActive = false
     private var policy = FocusPolicy()
     private var presentation = FocusPresentation()
     private var timer: Timer?
@@ -86,17 +101,41 @@ import OnwardCore
     private var statusTransitions: [[String: Any]] = []
     private var retryAfter = Date.distantPast
     private var lastAlertAt = Date.distantPast
-    private var redAlerted = false
+    private var distractionReminder = DistractionReminder()
     private var systemSleeping = false
     private var sessionInactive = false
     private var sleeping: Bool { systemSleeping || sessionInactive }
-    private var correctionNotes: [String] = []
     private var lastNotificationSettingsRead = Date.distantPast
     private var notificationFailure: String?
     private static let notificationsDisabledMessage = "Notification banners are disabled. Enable Onward in System Settings > Notifications to show reminder banners."
 
-    init(audioEnabled: Bool = true) {
+    init(audioEnabled: Bool = true, persistenceEnabled: Bool = true) {
         apiKey = Credentials.read() ?? ""; hasKey = !apiKey.isEmpty
+        if persistenceEnabled {
+            goalStore = GoalLibraryFileStore(url: AppStorage.directory.appendingPathComponent("goals.json"))
+            spendStore = JevSpendFileStore(url: AppStorage.directory.appendingPathComponent("jev-spend.json"))
+            do {
+                goalLibrary = try goalStore!.loadOrMigrate(goal: goal, context: context)
+                if let active = activeSavedGoal { goal = active.goal; context = active.context }
+            } catch { knowledgeError = "Saved goals could not be loaded. Existing data has been kept intact." }
+            refreshSpend()
+            cameraController = CameraAttentionController { [weak self] snapshot in
+                guard let self else { return }
+                self.cameraSnapshot = snapshot
+                if self.isRunning && !self.sleeping &&
+                    (SystemActivity.idleSeconds < 300 || self.cameraOverrideActive || self.freshCameraDistraction) {
+                    self.updateStatus()
+                }
+            }
+            configureCamera()
+        } else {
+            cameraEnabled = false
+        }
+        client.onSpendRecorded = { [weak self] ledger, error in
+            guard let self else { return }
+            if let ledger { self.spendLedger = ledger }
+            self.spendError = error
+        }
         policy.redAfter = redAfter
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
@@ -122,21 +161,35 @@ import OnwardCore
     func start(goal: String, context: String) {
         let nextGoal = goal.trimmingCharacters(in: .whitespacesAndNewlines)
         let nextContext = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !nextGoal.isEmpty {
+            var library = goalLibrary
+            do {
+                let existing = activeSavedGoal
+                _ = try library.saveGoal(id: existing?.id, title: existing?.title ?? String(nextGoal.prefix(60)),
+                                         goal: nextGoal, context: nextContext)
+                guard persistGoals(library) else { return }
+            } catch { knowledgeError = error.localizedDescription; return }
+        }
         if nextGoal != self.goal || nextContext != self.context || nextGoal.isEmpty { presentation.reset() }
         self.goal = nextGoal
         self.context = nextContext
-        UserDefaults.standard.set(self.goal, forKey: "goal"); UserDefaults.standard.set(self.context, forKey: "context")
+        if goalStore != nil {
+            UserDefaults.standard.set(self.goal, forKey: "goal"); UserDefaults.standard.set(self.context, forKey: "context")
+        }
         resetEvidence()
         guard !self.goal.isEmpty else { isRunning = false; status = .ready; return }
         isRunning = true; startedAt = Date(); status = .observing; error = nil
+        configureCamera()
         activeAppChanged()
     }
     func togglePause() {
-        if isRunning { isRunning = false; resetEvidence(); status = .paused }
+        if isRunning { isRunning = false; resetEvidence(); status = .paused; configureCamera() }
         else { start(goal: goal, context: context) }
     }
     func stop(publishStatus: Bool = true) {
         isRunning = false; resetEvidence(); timer?.invalidate(); timer = nil
+        cameraPermissionTask?.cancel(); cameraPermissionTask = nil
+        cameraController?.stop(); cameraController = nil
         timeCueController?.stop(); timeCueController = nil
         SoundPlayer.shared.stopAll()
         if publishStatus { publishBrowserStatus() }
@@ -146,8 +199,9 @@ import OnwardCore
     private func resetEvidence() {
         revision = UUID(); classificationTask?.cancel(); classificationTask = nil
         activeRequestID = nil; needsCapture = true
-        policy.reset(); judgment = nil; lastJudgmentFingerprint = ""; lastJudgmentSurface = nil; redAlerted = false
+        policy.reset(); judgment = nil; lastJudgmentFingerprint = ""; lastJudgmentSurface = nil; distractionReminder.reset()
         retryAfter = .distantPast; lastRequestedAt = .distantPast
+        cameraOverrideActive = false
     }
     private func preferenceChanged(_ name: String, _ value: Bool) {
         UserDefaults.standard.set(value, forKey: name); resetEvidence(); lastCaptureAt = .distantPast
@@ -157,11 +211,14 @@ import OnwardCore
         if let sessionInactive { self.sessionInactive = sessionInactive }
         resetEvidence(); lastCaptureAt = .distantPast
         timeCueController?.setSuspended(sleeping)
+        configureCamera()
         if sleeping { SoundPlayer.shared.stopAll() }
         if isRunning { status = sleeping ? .idle : .observing }
     }
     private func tick() {
         now = Date(); accessibilityGranted = AXIsProcessTrusted(); screenGranted = CGPreflightScreenCaptureAccess()
+        if now.timeIntervalSince(lastSpendRead) >= 10 { refreshSpend() }
+        configureCamera()
         timeCueController?.setSuspended(sleeping || NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.loginwindow")
         if now.timeIntervalSince(lastNotificationSettingsRead) >= 10 { refreshNotifications() }
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.loginwindow" {
@@ -173,12 +230,14 @@ import OnwardCore
         guard isRunning else { return }
         guard !sleeping else { status = .idle; return }
         let idle = SystemActivity.idleSeconds
-        guard idle < 300 else {
+        guard idle < 300 || cameraOverrideActive || freshCameraDistraction else {
             if status != .idle { resetEvidence() }
             status = .idle; return
         }
         guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier else {
-            holdStatusWhileInspecting(); return
+            if cameraOverrideActive || freshCameraDistraction { updateStatus() }
+            else { holdStatusWhileInspecting() }
+            return
         }
         if Date().timeIntervalSince(lastCaptureAt) >= 4 { capture() }
         updateStatus()
@@ -195,6 +254,19 @@ import OnwardCore
                                     "focusStatus": status.rawValue, "observerPID": ProcessInfo.processInfo.processIdentifier,
                                     "displayStatus": displayStatus.rawValue,
                                     "holdingPreviousStatus": isHoldingStatus,
+                                    "savedGoalCount": goalLibrary.goals.count,
+                                    "activeGoalAnnotationCount": goalAnnotations.count,
+                                    "pendingReviewCount": pendingReviewCount,
+                                    "jevSpend": ["estimatedNanodollars": totalSpend.estimatedNanodollars,
+                                                 "todayNanodollars": todaySpend.estimatedNanodollars,
+                                                 "requests": totalSpend.requestCount,
+                                                 "unpricedRequests": totalSpend.unpricedRequests,
+                                                 "unreportedRequests": totalSpend.unreportedRequests],
+                                    "warningPulseID": warningPulseID, "recoveryPulseID": recoveryPulseID,
+                                    "cameraEnabled": cameraEnabled,
+                                    "cameraStatus": cameraSnapshot.status.rawValue,
+                                    "cameraCalibrated": cameraSnapshot.calibrated,
+                                    "cameraDistraction": cameraOverrideActive,
                                     "offGoalSeconds": offGoalSeconds,
                                     "statusTransitions": statusTransitions,
                                     "idleSeconds": idle.isFinite ? idle as Any : NSNull(),
@@ -298,7 +370,7 @@ import OnwardCore
         axObserver = nil; observedPID = 0
     }
     func capture() {
-        guard isRunning, !sleeping, captureTask == nil, let app = NSWorkspace.shared.frontmostApplication,
+        guard isRunning, !sleeping, !cameraOverrideActive, captureTask == nil, let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != Bundle.main.bundleIdentifier, app.bundleIdentifier != "com.apple.loginwindow",
               SystemActivity.idleSeconds < 300 else { return }
         let pid = app.processIdentifier; let name = app.localizedName ?? "Unknown app"; let bundle = app.bundleIdentifier ?? ""
@@ -336,7 +408,7 @@ import OnwardCore
         }
     }
     private func classifyIfNeeded() {
-        guard isRunning, !sleeping, !needsCapture, captureTask == nil, classificationTask == nil, Date() >= retryAfter,
+        guard isRunning, !sleeping, !cameraOverrideActive, !needsCapture, captureTask == nil, classificationTask == nil, Date() >= retryAfter,
               let snapshot = observation, NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.pid,
               snapshot.bundleID != Bundle.main.bundleIdentifier,
               snapshot.bundleID != "com.apple.loginwindow", status != .idle,
@@ -347,14 +419,15 @@ import OnwardCore
         let changed = lastJudgmentFingerprint != fingerprint
         guard Date().timeIntervalSince(lastRequestedAt) >= (changed ? 3 : 20) else { return }
         let generation = revision; let goal = self.goal; let context = self.context; let key = apiKey
-        let recent = entries.prefix(5).reversed().map { $0.observation.summary }
+        let recent = entries.filter(belongsToActiveGoal).prefix(5).reversed().map { $0.observation.summary }
         lastRequestedAt = Date()
         let requestID = UUID(); activeRequestID = requestID
         classificationTask = Task { [weak self] in
             guard let self else { return }
             defer { if self.activeRequestID == requestID { self.classificationTask = nil; self.activeRequestID = nil } }
             do {
-                let payload = try JevContract.request(goal: goal, context: context, observation: snapshot, recent: recent, corrections: self.correctionNotes)
+                let notes = self.activeSavedGoal.map { self.goalLibrary.relevantNotes(for: $0.id, observation: snapshot) } ?? []
+                let payload = try JevContract.request(goal: goal, context: context, observation: snapshot, recent: recent, corrections: notes)
                 self.lastRequestData = payload
                 let result = try await self.client.classify(payload: payload, key: key)
                 self.requestCount += 1; self.inputTokens += result.inputTokens
@@ -362,9 +435,11 @@ import OnwardCore
                       self.observation?.fingerprint == fingerprint,
                       NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.pid else { return }
                 self.judgment = result; self.lastJudgmentFingerprint = fingerprint; self.lastJudgmentSurface = FocusSurface(snapshot)
-                self.policy.accept(result, at: Date()); self.error = nil
-                let entry = ActivityEntry(goal: goal, observation: snapshot, judgment: result)
-                if self.entries.first?.observation.fingerprint != fingerprint || self.entries.first?.judgment?.alignment != result.alignment { self.record(entry) }
+                if !self.cameraOverrideActive { self.policy.accept(result, at: Date()) }
+                self.error = nil
+                let entry = ActivityEntry(goal: goal, observation: snapshot, judgment: result, goalID: self.activeSavedGoal?.id)
+                if (self.entries.first.map({ !self.belongsToActiveGoal($0) }) ?? true) ||
+                    self.entries.first?.observation.fingerprint != fingerprint || self.entries.first?.judgment?.alignment != result.alignment { self.record(entry) }
                 self.updateStatus()
             } catch {
                 guard !Task.isCancelled, self.revision == generation else { return }
@@ -374,29 +449,211 @@ import OnwardCore
         }
     }
     private func updateStatus() {
-        guard isRunning else { return }
+        guard isRunning, !sleeping,
+              NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.apple.loginwindow" else { return }
+        if updateCameraDistraction() { return }
         guard error == nil else { status = .unavailable; return }
         guard let current = observation,
               lastJudgmentSurface?.canDisplayJudgment(for: current, foregroundPID: NSWorkspace.shared.frontmostApplication?.processIdentifier, at: Date()) == true else { status = .observing; return }
-        let previous = status; status = policy.status(at: Date())
+        let previous = status
+        let previousDisplay = displayStatus
+        status = policy.status(at: Date())
         // Retaining a color does not establish new evidence for a reminder.
         guard !policy.isHoldingStatus else { return }
-        if status == .focused || status == .unclear { redAlerted = false }
+        if status == .focused && [.drifting, .distracted].contains(previousDisplay) { recoveryPulseID += 1 }
         if status == .drifting && previous != .drifting && Date().timeIntervalSince(lastAlertAt) > 90 {
             alert(title: "You're drifting", body: "\(current.appName) appears unrelated to: \(goal)", sound: false)
             lastAlertAt = Date()
         }
-        if status == .distracted && !redAlerted {
-            redAlerted = true
-            alert(title: "Come back to your goal", body: goal, sound: soundEnabled)
+        remindIfNeeded()
+    }
+    private var freshCameraDistraction: Bool {
+        cameraEnabled && cameraSnapshot.isFresh(at: Date()) && cameraSnapshot.isDistracted
+    }
+    var cameraDistractionReason: String? {
+        guard cameraOverrideActive else { return nil }
+        return freshCameraDistraction ? cameraSnapshot.reason : "Waiting for a clear camera reading. Keeping your last status."
+    }
+    /// Camera evidence can establish distraction; returning to the screen still requires
+    /// a fresh app judgment before green. Missing frames never imply regained focus.
+    private func updateCameraDistraction() -> Bool {
+        if freshCameraDistraction {
+            if !cameraOverrideActive {
+                classificationTask?.cancel(); classificationTask = nil; activeRequestID = nil
+                cameraOverrideActive = true
+            }
+            policy.acceptOffGoal(at: Date())
+            status = policy.status(at: Date())
+            remindIfNeeded()
+            return true
         }
+        guard cameraOverrideActive else { return false }
+        if cameraEnabled && (cameraSnapshot.status != .present || !cameraSnapshot.isFresh(at: Date())) {
+            policy.acceptUncertainty(at: Date()); status = policy.status(at: Date())
+            return true
+        }
+        resetEvidence(); lastCaptureAt = .distantPast; status = .observing
+        return true
+    }
+    private func remindIfNeeded() {
+        guard !policy.isHoldingStatus,
+              distractionReminder.shouldRemind(status: status, confirmedSeconds: policy.offGoalDuration(at: Date()),
+                                                episodeStartedAt: policy.offGoalSince) else { return }
+        warningPulseID += 1
+        alert(title: cameraOverrideActive ? "Look back at your screen" : "Come back to your goal",
+              body: cameraDistractionReason ?? goal, sound: soundEnabled)
+    }
+    func setCameraEnabled(_ enabled: Bool) {
+        cameraPermissionTask?.cancel(); cameraPermissionPending = false
+        guard enabled else {
+            cameraEnabled = false; UserDefaults.standard.set(false, forKey: "cameraAttentionEnabled")
+            configureCamera()
+            if cameraOverrideActive { resetEvidence(); status = isRunning ? .observing : .paused }
+            return
+        }
+        guard let cameraController else { return }
+        cameraPermissionPending = true
+        cameraPermissionTask = Task { [weak self] in
+            let allowed = await cameraController.requestPermission()
+            guard !Task.isCancelled, let self else { return }
+            self.cameraPermissionPending = false
+            self.cameraEnabled = allowed
+            UserDefaults.standard.set(allowed, forKey: "cameraAttentionEnabled")
+            self.configureCamera()
+            if !allowed {
+                self.cameraSnapshot = CameraAttentionSnapshot(status: .permissionNeeded,
+                    reason: "Camera access is not allowed. Enable Onward in System Settings → Privacy & Security → Camera.")
+            }
+        }
+    }
+    func calibrateCamera() {
+        guard cameraEnabled, !sleeping else { return }
+        cameraController?.calibrate()
+    }
+    private func configureCamera() {
+        let unlocked = NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.apple.loginwindow"
+        cameraController?.configure(enabled: cameraEnabled, active: isRunning && !sleeping && unlocked,
+                                    suspended: sleeping || !unlocked)
     }
     func correct(_ alignment: Alignment) {
         guard let observation else { return }
-        let note = "For goal \(goal), the user marked this specific activity as \(alignment.rawValue): \(observation.summary)"
-        correctionNotes.append(boundedText(note, bytes: 1000)); correctionNotes = Array(correctionNotes.suffix(6))
-        record(ActivityEntry(goal: goal, observation: observation, judgment: judgment, correction: alignment))
-        resetEvidence(); classifyIfNeeded()
+        let entry = entries.first(where: { belongsToActiveGoal($0) && $0.observation.fingerprint == observation.fingerprint })
+            ?? ActivityEntry(goal: goal, observation: observation, judgment: judgment, goalID: activeSavedGoal?.id)
+        annotate(entry, alignment: alignment, note: "")
+    }
+    var activeSavedGoal: SavedGoal? { goalLibrary.goals.first { $0.id == goalLibrary.activeGoalID } }
+    var goalAnnotations: [GoalAnnotation] {
+        activeSavedGoal.map { goalLibrary.annotations(for: $0.id) } ?? []
+    }
+    var reviewEntries: [ActivityEntry] {
+        guard activeSavedGoal != nil else { return [] }
+        let learned = Set(goalAnnotations.filter { $0.alignment != .unclear }.map { reviewIdentity($0.observation) })
+        var seen = Set<String>()
+        return entries.filter { entry in
+            guard belongsToActiveGoal(entry), entry.correction == nil || entry.correction == .unclear else { return false }
+            let identity = reviewIdentity(entry.observation)
+            return !learned.contains(identity) && seen.insert(identity).inserted
+        }.sorted {
+            let a = $0.judgment == nil || $0.judgment?.alignment == .unclear
+            let b = $1.judgment == nil || $1.judgment?.alignment == .unclear
+            return a != b ? a : $0.date > $1.date
+        }
+    }
+    var pendingReviewCount: Int { reviewEntries.count }
+    private func belongsToActiveGoal(_ entry: ActivityEntry) -> Bool {
+        guard let active = activeSavedGoal else { return false }
+        if let goalID = entry.goalID { return goalID == active.id }
+        // TEMP-COMPAT 2026-09-22: pre-library history has no goal ID. Attribute it only
+        // to the original imported goal, never a new goal with identical text. Remove
+        // this nil-ID fallback when pre-library activity logs have rotated out on all
+        // supported installations; retain goalID for new history and delete migration tests.
+        return active.id == goalLibrary.goals.first?.id && entry.goal == active.goal
+    }
+    private func reviewIdentity(_ observation: Observation) -> String {
+        if let workspace = observation.activeWorkspace {
+            return [observation.bundleID, workspace.project, workspace.thread].joined(separator: "\u{1f}")
+        }
+        return [observation.bundleID, observation.url.isEmpty ? observation.windowTitle : observation.url].joined(separator: "\u{1f}")
+    }
+    var todaySpend: JevSpendTotals { spendLedger.today(at: now) }
+    var totalSpend: JevSpendTotals { spendLedger.total }
+    private func refreshSpend() {
+        lastSpendRead = Date()
+        guard let spendStore else { return }
+        do { spendLedger = try spendStore.load(); spendError = nil }
+        catch { spendError = "Jev usage could not be loaded. Existing usage data has been kept intact." }
+    }
+    @discardableResult private func persistGoals(_ library: GoalLibrary) -> Bool {
+        do {
+            try goalStore?.save(library)
+            goalLibrary = library; knowledgeError = nil
+            return true
+        } catch { knowledgeError = "Your goal knowledge could not be saved. Existing data has been kept intact."; return false }
+    }
+    func saveGoal(id: UUID?, title: String, goal: String, context: String) {
+        var library = goalLibrary
+        do {
+            _ = try library.saveGoal(id: id, title: title, goal: goal, context: context)
+            guard persistGoals(library) else { return }
+            applySelectedGoal()
+        } catch { knowledgeError = error.localizedDescription }
+    }
+    func selectGoal(_ id: UUID) {
+        guard goalLibrary.activeGoalID != id else { return }
+        var library = goalLibrary
+        do {
+            try library.selectGoal(id)
+            guard persistGoals(library) else { return }
+            applySelectedGoal()
+        } catch { knowledgeError = error.localizedDescription }
+    }
+    private func applySelectedGoal() {
+        guard let selected = activeSavedGoal else { return }
+        let resume = isRunning
+        goal = selected.goal; context = selected.context
+        if goalStore != nil {
+            UserDefaults.standard.set(goal, forKey: "goal"); UserDefaults.standard.set(context, forKey: "context")
+        }
+        presentation.reset(); resetEvidence(); observation = nil; error = nil
+        isRunning = resume
+        status = resume ? .observing : .paused
+        configureCamera()
+        if resume { startedAt = Date(); activeAppChanged() }
+    }
+    func annotate(_ entry: ActivityEntry, alignment: Alignment, note: String) {
+        guard let active = activeSavedGoal, belongsToActiveGoal(entry) else {
+            knowledgeError = "Select this activity's goal before teaching Jev about it."; return
+        }
+        var library = goalLibrary
+        do {
+            if let existing = goalAnnotations.first(where: { $0.activityID == entry.id }) {
+                try library.updateAnnotation(id: existing.id, alignment: alignment, note: note)
+            } else {
+                _ = try library.addAnnotation(goalID: active.id, alignment: alignment, note: note,
+                                              observation: entry.observation, activityID: entry.id)
+            }
+            guard persistGoals(library) else { return }
+            if let index = entries.firstIndex(where: { $0.id == entry.id }) { entries[index].correction = alignment }
+            resetEvidence(); needsCapture = true
+        } catch { knowledgeError = error.localizedDescription }
+    }
+    func updateAnnotation(_ id: UUID, alignment: Alignment, note: String) {
+        var library = goalLibrary
+        do {
+            try library.updateAnnotation(id: id, alignment: alignment, note: note)
+            guard persistGoals(library) else { return }
+            resetEvidence()
+        } catch { knowledgeError = error.localizedDescription }
+    }
+    func removeAnnotation(_ id: UUID) {
+        var library = goalLibrary
+        do {
+            let activityID = goalAnnotations.first { $0.id == id }?.activityID
+            try library.removeAnnotation(id)
+            guard persistGoals(library) else { return }
+            if let activityID, let index = entries.firstIndex(where: { $0.id == activityID }) { entries[index].correction = nil }
+            resetEvidence()
+        } catch { knowledgeError = error.localizedDescription }
     }
     private func record(_ entry: ActivityEntry) {
         entries.insert(entry, at: 0); entries = Array(entries.prefix(150))

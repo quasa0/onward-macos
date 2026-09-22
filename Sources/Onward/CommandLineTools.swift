@@ -62,7 +62,7 @@ enum CommandLineTools {
                     print(String(decoding: data, as: UTF8.self))
                 } else { print(String(data: try AppStorage.encoder.encode(observation), encoding: .utf8)!) }
             case "--render-preview":
-                guard (2...6).contains(arguments.count) else { throw CLIError.message("Provide a PNG path, optional view (now/activity/settings/hud/glow), state, theme (light/dark), and dimensions (980x780).") }
+                guard (2...6).contains(arguments.count) else { throw CLIError.message("Provide a PNG path, optional view (now/activity/settings/goals/review/learned/hud/glow), state, theme (light/dark), and dimensions (980x780).") }
                 let dimensions = arguments.count > 5 ? arguments[5].split(separator: "x").compactMap { Double($0) } : [980, 780]
                 guard dimensions.count == 2, dimensions[0] >= 860, dimensions[1] >= 690,
                       dimensions[0] <= 2000, dimensions[1] <= 2000 else { throw CLIError.message("Preview dimensions must be 860x690 through 2000x2000.") }
@@ -78,7 +78,7 @@ enum CommandLineTools {
     @MainActor private static func renderPreview(to url: URL, surface: String, state: String, dark: Bool, dimensions: NSSize) async throws {
         // Synthetic, offscreen UI only. No screen capture, classification, or preference changes.
         NSApp.setActivationPolicy(.prohibited)
-        let model = ObserverModel(audioEnabled: false); model.stop(publishStatus: false)
+        let model = ObserverModel(audioEnabled: false, persistenceEnabled: false); model.stop(publishStatus: false)
         model.goal = ""; model.context = ""; model.entries = []
         let establishedState = state.hasPrefix("checking-") ? String(state.dropFirst("checking-".count)) : state
         model.status = FocusStatus(rawValue: establishedState) ?? .ready
@@ -100,6 +100,24 @@ enum CommandLineTools {
             let alignment: OnwardCore.Alignment = [.drifting, .distracted].contains(model.displayStatus) ? .offGoal : .onGoal
             model.judgment = Judgment(alignment: alignment, probabilities: [alignment.rawValue: 0.94], confidence: 0.94)
             model.entries = [ActivityEntry(goal: model.goal, observation: observation, judgment: model.judgment)]
+            var library = GoalLibrary()
+            let active = try library.saveGoal(title: "Onward", goal: model.goal, context: model.context)
+            _ = try library.saveGoal(title: "Fastclip", goal: "Improve Fastclip's video editor", context: "Editing, timeline performance and export quality.")
+            try library.selectGoal(active.id)
+            _ = try library.addAnnotation(goalID: active.id, alignment: .onGoal,
+                                          note: "Apple Vision reference is needed for local OCR.", observation: observation)
+            model.goalLibrary = library
+            var uncertain = observation
+            uncertain.windowTitle = "Selecting a macOS OCR approach"
+            uncertain.tabTitle = uncertain.windowTitle
+            uncertain.url = "https://example.com/macos-ocr-options"
+            var entry = ActivityEntry(goal: model.goal, observation: uncertain,
+                                      judgment: Judgment(alignment: .unclear, probabilities: ["unclear": 0.78], confidence: 0.61))
+            entry.date = Date().addingTimeInterval(-30)
+            model.entries.insert(entry, at: 0)
+            var spend = JevSpendLedger(trackingStartedAt: Date().addingTimeInterval(-3600))
+            spend.record(receipt: JevSpendReceipt(responseData: Data(#"{"model":"jev-1.13.0","usage":{"input_tokens":184250}}"#.utf8)), at: Date())
+            model.spendLedger = spend
         }
         let size = surface == "hud" ? NSSize(width: GoalHUD.side, height: GoalHUD.side) : dimensions
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
@@ -111,6 +129,9 @@ enum CommandLineTools {
         case "glow": root = AnyView(ScreenEdgeGlowPreview(status: model.displayStatus))
         case "settings": root = AnyView(Dashboard(model: model, initialSelection: "Settings"))
         case "activity": root = AnyView(Dashboard(model: model, initialSelection: "Activity"))
+        case "goals": root = AnyView(Dashboard(model: model, initialSelection: "Goals"))
+        case "review": root = AnyView(Dashboard(model: model, initialSelection: "Review"))
+        case "learned": root = AnyView(Dashboard(model: model, initialSelection: "Review", initialReviewSection: "Learned examples"))
         case "now": root = AnyView(Dashboard(model: model))
         default: throw CLIError.message("Unknown preview view: \(surface)")
         }
@@ -148,12 +169,14 @@ enum CommandLineTools {
     }
     @MainActor private static func smoke() async throws {
         try smokeEdgeGlow()
+        try smokeAnimatedGlow()
+        try smokeGoalReview()
         for resource in WarningSoundChoice.allCases.map(\.resourceName) + TimeCueSoundChoice.allCases.map(\.resourceName) {
             _ = try SoundPlayer.load(resourceName: resource)
         }
         print("PASS all \(WarningSoundChoice.allCases.count) warning sounds and \(TimeCueSoundChoice.allCases.count) time cues decode (silent validation)")
         async let timerCheck: Void = smokeTimeCueTimer()
-        let presentationModel = ObserverModel(audioEnabled: false); presentationModel.stop(publishStatus: false)
+        let presentationModel = ObserverModel(audioEnabled: false, persistenceEnabled: false); presentationModel.stop(publishStatus: false)
         for established in [FocusStatus.focused, .drifting, .distracted] {
             presentationModel.status = established
             for pending in [FocusStatus.observing, .unclear, .paused, .idle, .unavailable] {
@@ -231,7 +254,7 @@ enum CommandLineTools {
             print("PASS native workspace fixture: \(project), \(result.alignment.rawValue), p=\(String(format: "%.3f", result.probability))")
         }
         try await timerCheck
-        print("PASS smoke test: edge glow + sound library + clock-aligned timer + retained display + OCR + authenticated Jev + nine classifications")
+        print("PASS smoke test: animated edge effects + goal review + sound library + clock-aligned timer + retained display + OCR + nine authenticated Jev classifications")
     }
 
     @MainActor private static func smokeTimeCueTimer() async throws {
@@ -296,6 +319,64 @@ enum CommandLineTools {
             }
         }
         print("PASS edge glow: four yellow/red edges, wider red, transparent center, no green, click-through renderer (offscreen)")
+    }
+    @MainActor private static func smokeAnimatedGlow() throws {
+        let view = ScreenEdgeGlowView(status: .distracted)
+        view.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+        let options = view.animationDiagnostics
+        guard options.movingHighlight == (!options.reduceMotion && !options.reduceTransparency) else {
+            throw CLIError.message("Warning glow motion does not respect accessibility settings.")
+        }
+        view.playWarningPulse()
+        guard view.animationDiagnostics.warningPulse else { throw CLIError.message("Warning pulse did not start.") }
+        view.update(status: .focused)
+        view.playRecoveryPulse()
+        view.update(status: .focused)
+        guard view.animationDiagnostics.recoveryPulse,
+              view.animationDiagnostics.recoveryParticles == ((!options.reduceMotion && !options.reduceTransparency) ? 8 : 0) else {
+            throw CLIError.message("Recovery effect did not retain its pulse and appropriate particles.")
+        }
+        view.update(status: .drifting)
+        guard !view.animationDiagnostics.recoveryPulse else { throw CLIError.message("Recovery effect survived a warning transition.") }
+        view.stopAnimating()
+        let stopped = view.animationDiagnostics
+        guard !stopped.movingHighlight, !stopped.warningPulse, !stopped.recoveryPulse, stopped.recoveryParticles == 0 else {
+            throw CLIError.message("Glow effects did not stop cleanly.")
+        }
+        print("PASS animated glow: movement, warning pulse, recovery particles, stable updates and cleanup (offscreen)")
+    }
+    @MainActor private static func smokeGoalReview() throws {
+        let model = ObserverModel(audioEnabled: false, persistenceEnabled: false)
+        model.stop(publishStatus: false)
+        model.entries = []
+        model.saveGoal(id: nil, title: "One", goal: "Fix sign-in", context: "Project One")
+        guard let first = model.activeSavedGoal else { throw CLIError.message("Could not create first goal.") }
+        model.saveGoal(id: nil, title: "Two", goal: "Fix sign-in", context: "Project Two")
+        guard let second = model.activeSavedGoal else { throw CLIError.message("Could not create second goal.") }
+        var observation = Observation()
+        observation.appName = "Browser"; observation.bundleID = "test.browser"
+        observation.url = "https://example.com/sign-in"; observation.windowTitle = "Sign-in reference"
+        let firstEntry = ActivityEntry(goal: first.goal, observation: observation, goalID: first.id)
+        let secondEntry = ActivityEntry(goal: second.goal, observation: observation, goalID: second.id)
+        model.entries = [firstEntry, secondEntry]
+        guard model.reviewEntries.map(\.id) == [secondEntry.id] else { throw CLIError.message("Review mixed saved goals with identical instructions.") }
+        model.annotate(firstEntry, alignment: .onGoal, note: "Wrong goal")
+        guard model.goalLibrary.annotations.isEmpty else { throw CLIError.message("Review saved an example to the wrong goal.") }
+        model.annotate(secondEntry, alignment: .onGoal, note: "This reference is needed for Project Two.")
+        guard model.goalAnnotations.count == 1, model.reviewEntries.isEmpty else { throw CLIError.message("Annotation was not reflected in review.") }
+        model.selectGoal(first.id)
+        guard !model.isRunning, model.goalAnnotations.isEmpty,
+              model.reviewEntries.map(\.id) == [firstEntry.id],
+              model.goalLibrary.relevantNotes(for: first.id, observation: observation).isEmpty else {
+            throw CLIError.message("Switching goals leaked knowledge or changed pause state.")
+        }
+        model.selectGoal(second.id)
+        guard let annotation = model.goalAnnotations.first else { throw CLIError.message("Saved annotation disappeared.") }
+        model.updateAnnotation(annotation.id, alignment: .offGoal, note: "Actually irrelevant to this project.")
+        guard model.goalAnnotations.first?.alignment == .offGoal else { throw CLIError.message("Annotation edit failed.") }
+        model.removeAnnotation(annotation.id)
+        guard model.goalAnnotations.isEmpty, model.pendingReviewCount == 1 else { throw CLIError.message("Removing an example did not restore review.") }
+        print("PASS saved-goal review: stable identity, scoped knowledge, annotate/edit/remove and paused switching (synthetic)")
     }
     enum CLIError: LocalizedError { case message(String); var errorDescription: String? { if case .message(let text) = self { return text }; return nil } }
 }

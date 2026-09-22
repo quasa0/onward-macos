@@ -14,4 +14,5 @@
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAppleEventsUsageDescription</key><string>Onward reads your active browser tab title, exact URL, and page text to compare your current activity with your focus goal.</string>
 <key>NSScreenCaptureUsageDescription</key><string>Onward recognizes text locally using Apple Vision. Screenshots are never sent to Jev.</string>
+<key>NSCameraUsageDescription</key><string>Optional camera attention uses Apple Vision on this Mac to notice when you are absent or looking away. Frames are not saved or sent to Jev.</string>
 </dict></plist>

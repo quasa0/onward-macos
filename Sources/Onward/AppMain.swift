@@ -44,6 +44,8 @@ import Darwin
     private let showWindowOnLaunch: Bool
     private let resumeSession: Bool
     private var subscriptions = Set<AnyCancellable>()
+    private var lastWarningPulseID = 0
+    private var lastRecoveryPulseID = 0
     init(showWindowOnLaunch: Bool = true, resumeSession: Bool = false) {
         self.showWindowOnLaunch = showWindowOnLaunch; self.resumeSession = resumeSession
     }
@@ -124,6 +126,14 @@ import Darwin
         item.button?.font = .systemFont(ofSize: 11, weight: .medium)
         item.button?.toolTip = "\(model.displayStatus.title)\n\(model.goal)"
         screenGlow.update(status: model.displayStatus, enabled: model.screenGlowVisible)
+        if lastWarningPulseID != model.warningPulseID {
+            lastWarningPulseID = model.warningPulseID
+            screenGlow.playWarningPulse()
+        }
+        if lastRecoveryPulseID != model.recoveryPulseID {
+            lastRecoveryPulseID = model.recoveryPulseID
+            screenGlow.playRecoveryPulse()
+        }
         if model.showHUD && !model.goal.isEmpty {
             let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main
             if let screen {

@@ -618,13 +618,14 @@ import OnwardCore
         activeSavedGoal.map { goalLibrary.annotations(for: $0.id) } ?? []
     }
     var reviewEntries: [ActivityEntry] {
-        guard activeSavedGoal != nil else { return [] }
+        guard let active = activeSavedGoal else { return [] }
         let learned = Set(goalAnnotations.filter { $0.alignment != .unclear }.map { reviewIdentity($0.observation) })
         var seen = Set<String>()
         return entries.filter { entry in
             guard belongsToActiveGoal(entry), entry.correction == nil || entry.correction == .unclear else { return false }
             let identity = reviewIdentity(entry.observation)
-            return !learned.contains(identity) && seen.insert(identity).inserted
+            return !learned.contains(identity) && !goalLibrary.isReviewSkipped(goalID: active.id, identity: identity, date: entry.date)
+                && seen.insert(identity).inserted
         }.sorted {
             let a = $0.judgment == nil || $0.judgment?.alignment == .unclear
             let b = $1.judgment == nil || $1.judgment?.alignment == .unclear
@@ -713,6 +714,15 @@ import OnwardCore
             }
             if let index = entries.firstIndex(where: { $0.id == entry.id }) { entries[index].correction = alignment }
             resetEvidence(); needsCapture = true
+        } catch { knowledgeError = error.localizedDescription }
+    }
+    /// Hides this activity (and older activity with the same identity) from Review without teaching Jev.
+    func skipReview(_ entry: ActivityEntry) {
+        guard let active = activeSavedGoal, belongsToActiveGoal(entry) else { return }
+        var library = goalLibrary
+        do {
+            try library.skipReview(goalID: active.id, identity: reviewIdentity(entry.observation), through: entry.date)
+            persistGoals(library)
         } catch { knowledgeError = error.localizedDescription }
     }
     func updateAnnotation(_ id: UUID, alignment: Alignment, note: String) {

@@ -87,6 +87,12 @@ public enum ReviewProvenance: Equatable, Sendable {
     }
 }
 
+public struct ReviewSkip: Codable, Equatable, Sendable {
+    public var goalID: UUID
+    public var identity: String
+    public var skippedThrough: Date
+}
+
 /// Jev's recorded answer for one retained activity entry.
 public struct RetainedJudgment: Equatable, Sendable {
     public var observationID: UUID
@@ -112,9 +118,34 @@ public struct GoalLibrary: Codable, Equatable, Sendable {
     public private(set) var goals: [SavedGoal]
     public private(set) var annotations: [GoalAnnotation]
     public private(set) var activeGoalID: UUID?
+    /// Review items the user skipped, keyed by goal and review identity. Optional so
+    /// libraries written before skipping existed still decode.
+    public private(set) var reviewSkips: [ReviewSkip]?
 
     public init(goals: [SavedGoal] = [], annotations: [GoalAnnotation] = [], activeGoalID: UUID? = nil) {
         self.goals = goals; self.annotations = annotations; self.activeGoalID = activeGoalID
+    }
+
+    /// Hides this identity's activity up to `date`; newer activity of the same identity returns.
+    public mutating func skipReview(goalID: UUID, identity: String, through date: Date) throws {
+        guard goals.contains(where: { $0.id == goalID }) else { throw GoalLibraryError.goalNotFound }
+        var skips = (reviewSkips ?? []).filter { !($0.goalID == goalID && $0.identity == identity) }
+        skips.append(ReviewSkip(goalID: goalID, identity: boundedText(identity, bytes: 5000), skippedThrough: date))
+        reviewSkips = Array(skips.suffix(1000))
+    }
+
+    public func isReviewSkipped(goalID: UUID, identity: String, date: Date) -> Bool {
+        let identity = boundedText(identity, bytes: 5000)
+        return reviewSkips?.contains { $0.goalID == goalID && $0.identity == identity && date <= $0.skippedThrough } ?? false
+    }
+
+    /// Whether a saved example could ever match later activity in `relevantNotes`.
+    /// An app name alone (for example a "ChatGPT" window without a thread) cannot.
+    public static func canGuideFutureJudgments(_ observation: Observation) -> Bool {
+        if let project = observation.activeWorkspace?.project, !canonical(project).isEmpty { return true }
+        if !observation.url.isEmpty, observation.url.utf8.count <= 4096 { return true }
+        let title = canonical(observation.windowTitle)
+        return !title.isEmpty && title != canonical(observation.appName)
     }
 
     public var activeGoal: SavedGoal? { goals.first { $0.id == activeGoalID } }
@@ -151,6 +182,7 @@ public struct GoalLibrary: Codable, Equatable, Sendable {
         guard goals.contains(where: { $0.id == id }) else { throw GoalLibraryError.goalNotFound }
         goals.removeAll { $0.id == id }
         annotations.removeAll { $0.goalID == id }
+        reviewSkips?.removeAll { $0.goalID == id }
         if activeGoalID == id { activeGoalID = nil }
     }
 

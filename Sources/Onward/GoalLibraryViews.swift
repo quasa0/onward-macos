@@ -266,10 +266,13 @@ struct ReviewView: View {
                     .font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 LazyVStack(spacing: 14) {
                     ForEach(pending) { entry in
-                        ActivityReviewCard(model: model, entry: entry, goalTitle: goal.title) { alignment, note in
+                        ActivityReviewCard(model: model, entry: entry, goalTitle: goal.title, annotate: { alignment, note in
                             model.annotate(entry, alignment: alignment, note: note)
                             if model.knowledgeError == nil { savedMessage = "Example saved for \(goal.title)." }
-                        }
+                        }, skip: {
+                            model.skipReview(entry)
+                            if model.knowledgeError == nil { savedMessage = "Skipped. Nothing was taught to Jev." }
+                        })
                     }
                 }
             }
@@ -365,9 +368,13 @@ private struct ActivityReviewCard: View {
     let entry: ActivityEntry
     let goalTitle: String
     let annotate: (OnwardCore.Alignment, String) -> Void
+    let skip: () -> Void
     @State private var note = ""
 
     private var jevRelevant: Bool? { entry.judgment?.alignment.isRelevant }
+    /// Without a page, project or thread, any answer would be about the whole app and
+    /// could never match later activity, so the card offers only "Can't tell".
+    private var answerable: Bool { GoalLibrary.canGuideFutureJudgments(entry.observation) }
 
     var body: some View {
         Card {
@@ -377,16 +384,36 @@ private struct ActivityReviewCard: View {
                 }
                 ActivityIdentity(model: model, observation: entry.observation, date: entry.date)
                 Divider()
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(jevRelevant == nil ? "Jev was unsure. Is this relevant to \(goalTitle)?" : "Was Jev right?")
-                        .font(.system(size: 16, weight: .semibold))
-                    TextField("Optional note: why does this belong, or not?", text: $note, axis: .vertical)
-                        .textFieldStyle(.roundedBorder).lineLimit(1...4)
-                        .accessibilityLabel("Optional explanation for \(entry.observation.appName)")
-                    HStack(spacing: 10) {
-                        Spacer(minLength: 0)
-                        answerButtons
-                    }.controlSize(.large)
+                if answerable {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(jevRelevant == nil ? "Jev was unsure. Is this relevant to \(goalTitle)?" : "Was Jev right?")
+                            .font(.system(size: 16, weight: .semibold))
+                        TextField("Optional note: why does this belong, or not?", text: $note, axis: .vertical)
+                            .textFieldStyle(.roundedBorder).lineLimit(1...4)
+                            .accessibilityLabel("Optional explanation for \(entry.observation.appName)")
+                        HStack(spacing: 10) {
+                            Button { skip() } label: { Label("Can't tell", systemImage: "questionmark") }
+                                .buttonStyle(.bordered).help("Skip without teaching Jev")
+                            Spacer(minLength: 0)
+                            answerButtons
+                        }.controlSize(.large)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Not enough information to answer").font(.system(size: 16, weight: .semibold))
+                        Text("Onward saw only \(entry.observation.appName), with no page, project or conversation name. An answer here would apply to the whole app and could not match future activity, so it would not teach Jev anything.")
+                            .font(.system(size: 13)).foregroundStyle(.secondary).lineSpacing(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack {
+                            Text("To rule a whole app in or out, add it to the goal's context.")
+                                .font(.system(size: 12)).foregroundStyle(.secondary)
+                            Button("Open goals") { NotificationCenter.default.post(name: .onwardNavigate, object: "Goals") }
+                                .buttonStyle(.link).font(.system(size: 12))
+                            Spacer(minLength: 10)
+                            Button { skip() } label: { Label("Can't tell — skip", systemImage: "questionmark") }
+                                .buttonStyle(.borderedProminent).controlSize(.large)
+                        }
+                    }
                 }
                 CapturedTextDisclosure(observation: entry.observation)
             }
@@ -451,6 +478,9 @@ private struct LearnedExampleCard: View {
                     }.multilineTextAlignment(.trailing)
                 }
                 ActivityIdentity(model: model, observation: annotation.observation, date: annotation.createdAt)
+                if !GoalLibrary.canGuideFutureJudgments(annotation.observation) {
+                    InlineNotice(message: "Not used for future judgments: this example names only the app, with no page, project or conversation, so it cannot match later activity.")
+                }
                 if editing {
                     VStack(alignment: .leading, spacing: 12) {
                         Picker("Your answer", selection: $alignment) {

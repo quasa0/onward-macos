@@ -228,3 +228,35 @@ final class ReviewProvenanceTests: XCTestCase {
         XCTAssertEqual(library.annotations.first { $0.id == known.id }?.originalJudgment?.alignment, .onGoal)
     }
 }
+
+final class ReviewSkipTests: XCTestCase {
+    func testAppNameOnlyObservationCannotGuideAndMatchesNothing() throws {
+        var generic = Observation(); generic.appName = "ChatGPT"; generic.bundleID = "com.openai.codex"; generic.windowTitle = "ChatGPT"
+        generic.ocrText = "Some conversation text"
+        XCTAssertFalse(GoalLibrary.canGuideFutureJudgments(generic))
+        var library = GoalLibrary()
+        let goal = try library.saveGoal(title: "A", goal: "Work on A", context: "")
+        _ = try library.addAnnotation(goalID: goal.id, alignment: .offGoal, note: "", observation: generic)
+        // The claim shown in Review must hold: this example is never offered to Jev.
+        XCTAssertTrue(library.relevantNotes(for: goal.id, observation: generic).isEmpty)
+
+        var thread = generic; thread.activeWorkspace = ActiveWorkspaceEvidence(project: "ChatGPT", thread: "Launch plan", source: "test", evidence: "")
+        var page = generic; page.url = "https://example.com/doc"
+        var titled = generic; titled.windowTitle = "Launch plan"
+        XCTAssertTrue([thread, page, titled].allSatisfy(GoalLibrary.canGuideFutureJudgments))
+    }
+
+    func testSkipHidesOnlyThroughItsDateAndOnlyForItsGoal() throws {
+        var library = GoalLibrary()
+        let first = try library.saveGoal(title: "A", goal: "Work on A", context: "")
+        let second = try library.saveGoal(title: "B", goal: "Work on B", context: "")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        try library.skipReview(goalID: first.id, identity: "chat", through: now)
+        XCTAssertTrue(library.isReviewSkipped(goalID: first.id, identity: "chat", date: now.addingTimeInterval(-60)))
+        XCTAssertFalse(library.isReviewSkipped(goalID: first.id, identity: "chat", date: now.addingTimeInterval(1)))
+        XCTAssertFalse(library.isReviewSkipped(goalID: second.id, identity: "chat", date: now))
+        XCTAssertThrowsError(try library.skipReview(goalID: UUID(), identity: "chat", through: now))
+        try library.removeGoal(first.id)
+        XCTAssertEqual(library.reviewSkips, [])
+    }
+}

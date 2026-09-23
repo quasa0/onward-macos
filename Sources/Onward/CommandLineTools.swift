@@ -157,7 +157,10 @@ enum CommandLineTools {
                                 text: "A compilation of cat videos.")
             var videoEntry = ActivityEntry(goal: model.goal, observation: video, judgment: judged(.offGoal, 0.88))
             videoEntry.date = Date().addingTimeInterval(-150)
-            model.entries.insert(contentsOf: [entry, codeEntry, videoEntry], at: 0)
+            let chat = fixture("ChatGPT", "com.openai.codex", "ChatGPT", "", text: "")
+            var chatEntry = ActivityEntry(goal: model.goal, observation: chat, judgment: judged(.unclear, 0.7))
+            chatEntry.date = Date().addingTimeInterval(-20)
+            model.entries.insert(contentsOf: [chatEntry, entry, codeEntry, videoEntry], at: 0)
             var spend = JevSpendLedger(trackingStartedAt: Date().addingTimeInterval(-3600))
             spend.record(receipt: JevSpendReceipt(responseData: Data(#"{"model":"jev-1.13.0","usage":{"input_tokens":184250}}"#.utf8)), at: Date())
             model.spendLedger = spend

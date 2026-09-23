@@ -1,5 +1,10 @@
 # Worklog
 
+## 2026-09-23 — App-only Review cards accept answers again
+
+- User objected that an app-only ChatGPT card offered only "Can't tell" even when they knew the answer. Valid: the limit is matching, not the user's knowledge. Restored Relevant/Irrelevant (and "Jev was right"/"Wrong") on those cards, with a plain note that the answer is saved but Jev cannot use it yet. App-only examples no longer hide later cards through identity dedupe. Answering one records a skip through its date, so older indistinguishable moments of that app do not appear one after another.
+- Verification: 108 Swift tests pass; install, strict signature, and exact bundle comparison passed. Onward was running and was resumed with `--resume` (PID 54155, no error).
+
 ## 2026-09-23 — "Can't tell" for Review; app-only cards no longer ask for a label
 
 - User reported a Review card for a ChatGPT window with no conversation name that asked whether it was relevant; answering would label "ChatGPT in general". Cause: ChatGPT.app (`com.openai.codex`) is a Chromium shell (Chrome 153). It supports `AXEnhancedUserInterface` but not Electron's `AXManualAccessibility`, so Onward's opt-in never applies. Its default tree held 88 characters (window/group/button); only OCR (600–900 characters) carried content, and no ocrLayout exists for this app. The example matcher also never uses an app-name-only example: it needs a project, URL, or title different from the app name. Labeling such a card taught Jev nothing and hid later ChatGPT cards from Review through identity dedupe.

@@ -372,8 +372,7 @@ private struct ActivityReviewCard: View {
     @State private var note = ""
 
     private var jevRelevant: Bool? { entry.judgment?.alignment.isRelevant }
-    /// Without a page, project or thread, any answer would be about the whole app and
-    /// could never match later activity, so the card offers only "Can't tell".
+    /// Without a page, project or thread, an answer cannot match later activity; the card says so.
     private var answerable: Bool { GoalLibrary.canGuideFutureJudgments(entry.observation) }
 
     var body: some View {
@@ -384,36 +383,25 @@ private struct ActivityReviewCard: View {
                 }
                 ActivityIdentity(model: model, observation: entry.observation, date: entry.date)
                 Divider()
-                if answerable {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text(jevRelevant == nil ? "Jev was unsure. Is this relevant to \(goalTitle)?" : "Was Jev right?")
-                            .font(.system(size: 16, weight: .semibold))
-                        TextField("Optional note: why does this belong, or not?", text: $note, axis: .vertical)
-                            .textFieldStyle(.roundedBorder).lineLimit(1...4)
-                            .accessibilityLabel("Optional explanation for \(entry.observation.appName)")
-                        HStack(spacing: 10) {
-                            Button { skip() } label: { Label("Can't tell", systemImage: "questionmark") }
-                                .buttonStyle(.bordered).help("Skip without teaching Jev")
-                            Spacer(minLength: 0)
-                            answerButtons
-                        }.controlSize(.large)
-                    }
-                } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Not enough information to answer").font(.system(size: 16, weight: .semibold))
-                        Text("Onward saw only \(entry.observation.appName), with no page, project or conversation name. An answer here would apply to the whole app and could not match future activity, so it would not teach Jev anything.")
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(jevRelevant == nil ? "Jev was unsure. Is this relevant to \(goalTitle)?" : "Was Jev right?")
+                        .font(.system(size: 16, weight: .semibold))
+                    if !answerable {
+                        // The user may still know; say plainly what the answer can and cannot do.
+                        Label("Onward saw only \(entry.observation.appName), with no page, project or conversation name. Your answer is saved, but Jev cannot use it yet because later activity can't be matched to this moment.",
+                              systemImage: "info.circle")
                             .font(.system(size: 13)).foregroundStyle(.secondary).lineSpacing(2)
                             .fixedSize(horizontal: false, vertical: true)
-                        HStack {
-                            Text("To rule a whole app in or out, add it to the goal's context.")
-                                .font(.system(size: 12)).foregroundStyle(.secondary)
-                            Button("Open goals") { NotificationCenter.default.post(name: .onwardNavigate, object: "Goals") }
-                                .buttonStyle(.link).font(.system(size: 12))
-                            Spacer(minLength: 10)
-                            Button { skip() } label: { Label("Can't tell — skip", systemImage: "questionmark") }
-                                .buttonStyle(.borderedProminent).controlSize(.large)
-                        }
                     }
+                    TextField("Optional note: why does this belong, or not?", text: $note, axis: .vertical)
+                        .textFieldStyle(.roundedBorder).lineLimit(1...4)
+                        .accessibilityLabel("Optional explanation for \(entry.observation.appName)")
+                    HStack(spacing: 10) {
+                        Button { skip() } label: { Label("Can't tell", systemImage: "questionmark") }
+                            .buttonStyle(.bordered).help("Skip without teaching Jev")
+                        Spacer(minLength: 0)
+                        answerButtons
+                    }.controlSize(.large)
                 }
                 CapturedTextDisclosure(observation: entry.observation)
             }

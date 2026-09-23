@@ -619,7 +619,9 @@ import OnwardCore
     }
     var reviewEntries: [ActivityEntry] {
         guard let active = activeSavedGoal else { return [] }
-        let learned = Set(goalAnnotations.filter { $0.alignment != .unclear }.map { reviewIdentity($0.observation) })
+        // App-only examples cannot stand for later activity with the same app name.
+        let learned = Set(goalAnnotations.filter { $0.alignment != .unclear && GoalLibrary.canGuideFutureJudgments($0.observation) }
+            .map { reviewIdentity($0.observation) })
         var seen = Set<String>()
         return entries.filter { entry in
             guard belongsToActiveGoal(entry), entry.correction == nil || entry.correction == .unclear else { return false }
@@ -705,6 +707,10 @@ import OnwardCore
                 _ = try library.addAnnotation(goalID: active.id, alignment: alignment, note: note,
                                               observation: entry.observation, activityID: entry.id,
                                               originalJudgment: entry.judgment)
+            }
+            if !GoalLibrary.canGuideFutureJudgments(entry.observation) {
+                // Older app-only moments are indistinguishable from this one; newer ones still return.
+                try library.skipReview(goalID: active.id, identity: reviewIdentity(entry.observation), through: entry.date)
             }
             guard persistGoals(library) else { return }
             // Labeling is an explicit request to keep this example, even with history off.

@@ -49,9 +49,14 @@ enum CommandLineTools {
                 }
             case "--capture-once", "--capture-diagnostics":
                 guard let app = NSWorkspace.shared.frontmostApplication else { throw CLIError.message("No foreground app.") }
-                let observation = try await CaptureEngine.capture(pid: app.processIdentifier, name: app.localizedName ?? "", bundleID: app.bundleIdentifier ?? "", ocr: true, pageText: true)
-                if arguments.first == "--capture-diagnostics" {
+                let diagnostics = arguments.first == "--capture-diagnostics"
+                // Diagnostics request a review image to verify window matching; it is measured, never saved.
+                let result = try await CaptureEngine.capture(pid: app.processIdentifier, name: app.localizedName ?? "", bundleID: app.bundleIdentifier ?? "",
+                                                             ocr: true, pageText: true, screenshot: diagnostics)
+                let observation = result.observation
+                if diagnostics {
                     let data = try JSONSerialization.data(withJSONObject: [
+                        "screenshotBytes": result.screenshotJPEG?.count ?? 0,
                         "bundleID": observation.bundleID, "AXCharacters": observation.accessibilityText.count,
                         "OCRCharacters": observation.ocrText.count, "captureMilliseconds": observation.captureMilliseconds,
                         "workspace": observation.activeWorkspace?.project ?? "unresolved",
@@ -104,17 +109,55 @@ enum CommandLineTools {
             let active = try library.saveGoal(title: "Onward", goal: model.goal, context: model.context)
             _ = try library.saveGoal(title: "Fastclip", goal: "Improve Fastclip's video editor", context: "Editing, timeline performance and export quality.")
             try library.selectGoal(active.id)
+            // Review fixtures cover every verdict/provenance state, with and without a synthetic screenshot.
+            func fixture(_ app: String, _ bundle: String, _ title: String, _ url: String, text: String) -> Observation {
+                var value = Observation(); value.appName = app; value.bundleID = bundle
+                value.windowTitle = title; value.tabTitle = url.isEmpty ? "" : title; value.url = url
+                value.accessibilityText = text; value.sources = ["Accessibility"]
+                return value
+            }
+            func judged(_ alignment: OnwardCore.Alignment, _ probability: Double) -> Judgment {
+                Judgment(alignment: alignment, probabilities: [alignment.rawValue: probability], confidence: probability)
+            }
+            func screenshot(_ observation: Observation, accent: NSColor) {
+                if let data = syntheticWindowJPEG(title: observation.windowTitle, accent: accent, dark: dark) {
+                    model.setReviewScreenshotFixture(data, for: observation.id)
+                }
+            }
             _ = try library.addAnnotation(goalID: active.id, alignment: .onGoal,
-                                          note: "Apple Vision reference is needed for local OCR.", observation: observation)
+                                          note: "Apple Vision reference is needed for local OCR.", observation: observation,
+                                          originalJudgment: judged(.onGoal, 0.94))
+            screenshot(observation, accent: .systemBlue)
+            let news = fixture("Helium", "net.imput.helium", "Hacker News — Show HN: a native OCR app", "https://news.ycombinator.com/item?id=1",
+                               text: "Show HN thread comments about OCR apps.")
+            _ = try library.addAnnotation(goalID: active.id, alignment: .offGoal,
+                                          note: "Reading discussions is not building Onward.", observation: news,
+                                          originalJudgment: judged(.onGoal, 0.71))
+            screenshot(news, accent: .systemOrange)
+            let notes = fixture("Notes", "com.apple.Notes", "Onward capture ideas", "", text: "Ideas for window capture and review.")
+            _ = try library.addAnnotation(goalID: active.id, alignment: .onGoal, note: "", observation: notes,
+                                          originalJudgment: judged(.unclear, 0.66))
+            let mail = fixture("Mail", "com.apple.mail", "Newsletter — weekly deals", "", text: "Weekly deals newsletter.")
+            _ = try library.addAnnotation(goalID: active.id, alignment: .offGoal, note: "", observation: mail)
             model.goalLibrary = library
             var uncertain = observation
+            uncertain.id = UUID()
             uncertain.windowTitle = "Selecting a macOS OCR approach"
             uncertain.tabTitle = uncertain.windowTitle
             uncertain.url = "https://example.com/macos-ocr-options"
+            screenshot(uncertain, accent: .systemPurple)
             var entry = ActivityEntry(goal: model.goal, observation: uncertain,
                                       judgment: Judgment(alignment: .unclear, probabilities: ["unclear": 0.78], confidence: 0.61))
             entry.date = Date().addingTimeInterval(-30)
-            model.entries.insert(entry, at: 0)
+            let code = fixture("Xcode", "com.apple.dt.Xcode", "Onward — Capture.swift", "", text: "ScreenCaptureKit window capture.")
+            screenshot(code, accent: .systemTeal)
+            var codeEntry = ActivityEntry(goal: model.goal, observation: code, judgment: judged(.onGoal, 0.91))
+            codeEntry.date = Date().addingTimeInterval(-90)
+            let video = fixture("Helium", "net.imput.helium", "Funny cat compilation — YouTube", "https://www.youtube.com/watch?v=fixture",
+                                text: "A compilation of cat videos.")
+            var videoEntry = ActivityEntry(goal: model.goal, observation: video, judgment: judged(.offGoal, 0.88))
+            videoEntry.date = Date().addingTimeInterval(-150)
+            model.entries.insert(contentsOf: [entry, codeEntry, videoEntry], at: 0)
             var spend = JevSpendLedger(trackingStartedAt: Date().addingTimeInterval(-3600))
             spend.record(receipt: JevSpendReceipt(responseData: Data(#"{"model":"jev-1.13.0","usage":{"input_tokens":184250}}"#.utf8)), at: Date())
             model.spendLedger = spend
@@ -180,6 +223,29 @@ enum CommandLineTools {
         guard let data = output.representation(using: .png, properties: [:]) else { throw CLIError.message("Could not encode preview image.") }
         try data.write(to: url, options: .atomic)
         print("Rendered \(surface), \(state), \(dark ? "dark" : "light"): \(url.path)")
+    }
+    /// A drawn window, never a real capture, so committed previews contain no private content.
+    @MainActor private static func syntheticWindowJPEG(title: String, accent: NSColor, dark: Bool) -> Data? {
+        let size = NSSize(width: 1440, height: 900)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        (dark ? NSColor(white: 0.13, alpha: 1) : NSColor(white: 0.98, alpha: 1)).setFill(); NSRect(origin: .zero, size: size).fill()
+        (dark ? NSColor(white: 0.2, alpha: 1) : NSColor(white: 0.91, alpha: 1)).setFill(); NSRect(x: 0, y: 820, width: 1440, height: 80).fill()
+        for (index, color) in [NSColor.systemRed, .systemYellow, .systemGreen].enumerated() {
+            color.setFill(); NSBezierPath(ovalIn: NSRect(x: 28 + index * 34, y: 848, width: 22, height: 22)).fill()
+        }
+        let ink = dark ? NSColor(white: 0.92, alpha: 1) : NSColor(white: 0.12, alpha: 1)
+        (title as NSString).draw(at: NSPoint(x: 150, y: 843), withAttributes: [.font: NSFont.systemFont(ofSize: 26, weight: .medium), .foregroundColor: ink])
+        accent.withAlphaComponent(0.85).setFill(); NSBezierPath(roundedRect: NSRect(x: 80, y: 600, width: 760, height: 150), xRadius: 18, yRadius: 18).fill()
+        (title as NSString).draw(in: NSRect(x: 110, y: 630, width: 700, height: 100),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 46, weight: .bold), .foregroundColor: NSColor.white])
+        (dark ? NSColor(white: 0.32, alpha: 1) : NSColor(white: 0.82, alpha: 1)).setFill()
+        for row in 0..<8 { NSBezierPath(roundedRect: NSRect(x: 80, y: 520 - row * 52, width: row % 3 == 2 ? 820 : 1180, height: 20), xRadius: 10, yRadius: 10).fill() }
+        accent.withAlphaComponent(0.25).setFill(); NSBezierPath(roundedRect: NSRect(x: 1000, y: 600, width: 360, height: 150), xRadius: 18, yRadius: 18).fill()
+        ("Synthetic window · not a real capture" as NSString).draw(at: NSPoint(x: 80, y: 40),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 22), .foregroundColor: ink.withAlphaComponent(0.6)])
+        image.unlockFocus()
+        return image.cgImage(forProposedRect: nil, context: nil, hints: nil).flatMap(WindowScreenshot.jpeg)
     }
     @MainActor private static func cameraPreviewFixture() -> CGImage? {
         let image = NSImage(size: NSSize(width: 640, height: 480))
@@ -408,7 +474,8 @@ enum CommandLineTools {
         observation.appName = "Browser"; observation.bundleID = "test.browser"
         observation.url = "https://example.com/sign-in"; observation.windowTitle = "Sign-in reference"
         let firstEntry = ActivityEntry(goal: first.goal, observation: observation, goalID: first.id)
-        let secondEntry = ActivityEntry(goal: second.goal, observation: observation, goalID: second.id)
+        let jevAnswer = Judgment(alignment: .onGoal, probabilities: ["on_goal": 0.83], confidence: 0.83)
+        let secondEntry = ActivityEntry(goal: second.goal, observation: observation, judgment: jevAnswer, goalID: second.id)
         model.entries = [firstEntry, secondEntry]
         guard model.reviewEntries.map(\.id) == [secondEntry.id] else { throw CLIError.message("Review mixed saved goals with identical instructions.") }
         model.annotate(firstEntry, alignment: .onGoal, note: "Wrong goal")
@@ -425,9 +492,13 @@ enum CommandLineTools {
         guard let annotation = model.goalAnnotations.first else { throw CLIError.message("Saved annotation disappeared.") }
         model.updateAnnotation(annotation.id, alignment: .offGoal, note: "Actually irrelevant to this project.")
         guard model.goalAnnotations.first?.alignment == .offGoal else { throw CLIError.message("Annotation edit failed.") }
+        guard let edited = model.goalAnnotations.first, edited.originalJudgment == jevAnswer,
+              ReviewProvenance(original: edited.originalJudgment, answer: edited.alignment) == .corrected else {
+            throw CLIError.message("Review lost Jev's original answer after the user corrected it.")
+        }
         model.removeAnnotation(annotation.id)
         guard model.goalAnnotations.isEmpty, model.pendingReviewCount == 1 else { throw CLIError.message("Removing an example did not restore review.") }
-        print("PASS saved-goal review: stable identity, scoped knowledge, annotate/edit/remove and paused switching (synthetic)")
+        print("PASS saved-goal review: stable identity, scoped knowledge, Jev's original answer kept through correction, annotate/edit/remove and paused switching (synthetic)")
     }
     enum CLIError: LocalizedError { case message(String); var errorDescription: String? { if case .message(let text) = self { return text }; return nil } }
 }

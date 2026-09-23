@@ -25,6 +25,36 @@ enum AppStorage {
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         return text.split(separator: "\n").suffix(150).compactMap { try? decoder.decode(ActivityEntry.self, from: Data($0.utf8)) }.reversed()
     }
+    /// Jev's recorded answers for specific activity IDs, from both retained history files.
+    /// Only lines containing a requested ID are decoded.
+    static func retainedJudgments(for ids: Set<UUID>) -> [UUID: RetainedJudgment] {
+        guard !ids.isEmpty else { return [:] }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        func mentionsRequestedID(_ line: Substring) -> Bool {
+            line.ranges(of: #""id":""#).contains { range in
+                guard let end = line.index(range.upperBound, offsetBy: 36, limitedBy: line.endIndex),
+                      let id = UUID(uuidString: String(line[range.upperBound..<end])) else { return false }
+                return ids.contains(id)
+            }
+        }
+        var found: [UUID: RetainedJudgment] = [:]
+        for name in ["activity.previous.jsonl", "activity.jsonl"] {
+            guard let data = try? Data(contentsOf: directory.appendingPathComponent(name), options: .mappedIfSafe) else { continue }
+            for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where mentionsRequestedID(line) {
+                guard let entry = try? decoder.decode(ActivityEntry.self, from: Data(line.utf8)), ids.contains(entry.id),
+                      let judgment = entry.judgment else { continue }
+                found[entry.id] = RetainedJudgment(observationID: entry.observation.id, judgment: judgment)
+            }
+        }
+        return found
+    }
+}
+
+/// Serializes screenshot writes and pruning so concurrent saves cannot race the retention pass.
+actor ScreenshotWriter {
+    func save(_ jpeg: Data, for observationID: UUID, learned: Set<UUID>, in store: ActivityScreenshotStore) throws {
+        try store.save(jpeg, for: observationID, learned: learned)
+    }
 }
 
 enum Credentials {

@@ -73,11 +73,21 @@ import OnwardCore
     }
     @Published private(set) var soundError: String?
     @Published var saveHistory = UserDefaults.standard.object(forKey: "saveHistory") as? Bool ?? true { didSet { UserDefaults.standard.set(saveHistory, forKey: "saveHistory") } }
+    /// Review images of the focused window. Stored locally only; Jev receives text only.
+    @Published var saveScreenshots = UserDefaults.standard.object(forKey: "saveScreenshots") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(saveScreenshots, forKey: "saveScreenshots"); if !saveScreenshots { latestScreenshot = nil } }
+    }
+    @Published private(set) var screenshotError: String?
     @Published var redAfter = UserDefaults.standard.object(forKey: "redAfter") as? Double ?? 45 { didSet { UserDefaults.standard.set(redAfter, forKey: "redAfter"); policy.redAfter = redAfter } }
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     private var apiKey = ""
     private let client = JevClient()
     private var goalStore: GoalLibraryFileStore?
+    private var screenshotStore: ActivityScreenshotStore?
+    private let screenshotWriter = ScreenshotWriter()
+    /// The newest verified window image, bound to the text fingerprint it depicts.
+    private var latestScreenshot: (fingerprint: String, jpeg: Data)?
+    private var previewScreenshots: [UUID: Data] = [:]
     private var spendStore: JevSpendFileStore?
     private var lastSpendRead = Date.distantPast
     private var cameraController: CameraAttentionController?
@@ -118,11 +128,13 @@ import OnwardCore
         if persistenceEnabled {
             goalStore = GoalLibraryFileStore(url: AppStorage.directory.appendingPathComponent("goals.json"))
             spendStore = JevSpendFileStore(url: AppStorage.directory.appendingPathComponent("jev-spend.json"))
+            screenshotStore = ActivityScreenshotStore(directory: AppStorage.directory.appendingPathComponent("screenshots", isDirectory: true))
             do {
                 goalLibrary = try goalStore!.loadOrMigrate(goal: goal, context: context)
                 if let active = activeSavedGoal { goal = active.goal; context = active.context }
             } catch { knowledgeError = "Saved goals could not be loaded. Existing data has been kept intact." }
             refreshSpend()
+            restoreOriginalJudgments()
             cameraController = CameraAttentionController(onUpdate: { [weak self] snapshot in
                 guard let self else { return }
                 self.now = Date()
@@ -384,13 +396,22 @@ import OnwardCore
               SystemActivity.idleSeconds < 300 else { return }
         let pid = app.processIdentifier; let name = app.localizedName ?? "Unknown app"; let bundle = app.bundleIdentifier ?? ""
         let ocr = ocrEnabled; let browserText = browserTextEnabled; let generation = revision
+        let screenshot = saveScreenshots && screenshotStore != nil; let reuse = latestScreenshot?.fingerprint
         lastCaptureAt = Date()
         captureTask = Task { [weak self] in
             do {
-                let captured = try await CaptureEngine.capture(pid: pid, name: name, bundleID: bundle, ocr: ocr, pageText: browserText)
+                let result = try await CaptureEngine.capture(pid: pid, name: name, bundleID: bundle, ocr: ocr, pageText: browserText,
+                                                             screenshot: screenshot, reuseScreenshotFingerprint: reuse)
+                let captured = result.observation
                 guard let self else { return }
                 self.captureTask = nil
                 guard self.isRunning, self.revision == generation, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+                if let jpeg = result.screenshotJPEG, self.saveScreenshots {
+                    self.latestScreenshot = (captured.fingerprint, jpeg)
+                } else if self.latestScreenshot?.fingerprint != captured.fingerprint {
+                    // Never let an older image stand in for different content.
+                    self.latestScreenshot = nil
+                }
                 if let judgedSurface = self.lastJudgmentSurface, judgedSurface != FocusSurface(captured) {
                     self.lastJudgmentSurface = nil; self.lastJudgmentFingerprint = ""
                 }
@@ -428,6 +449,8 @@ import OnwardCore
         let changed = lastJudgmentFingerprint != fingerprint
         guard Date().timeIntervalSince(lastRequestedAt) >= (changed ? 3 : 20) else { return }
         let generation = revision; let goal = self.goal; let context = self.context; let key = apiKey
+        // Bind the image of this exact snapshot now; a later capture may replace latestScreenshot.
+        let screenshot = latestScreenshot?.fingerprint == fingerprint ? latestScreenshot?.jpeg : nil
         let recent = entries.filter(belongsToActiveGoal).prefix(5).reversed().map { $0.observation.summary }
         lastRequestedAt = Date()
         let requestID = UUID(); activeRequestID = requestID
@@ -448,7 +471,9 @@ import OnwardCore
                 self.error = nil
                 let entry = ActivityEntry(goal: goal, observation: snapshot, judgment: result, goalID: self.activeSavedGoal?.id)
                 if (self.entries.first.map({ !self.belongsToActiveGoal($0) }) ?? true) ||
-                    self.entries.first?.observation.fingerprint != fingerprint || self.entries.first?.judgment?.alignment != result.alignment { self.record(entry) }
+                    self.entries.first?.observation.fingerprint != fingerprint || self.entries.first?.judgment?.alignment != result.alignment {
+                    self.record(entry, screenshot: screenshot)
+                }
                 self.updateStatus()
             } catch {
                 guard !Task.isCancelled, self.revision == generation else { return }
@@ -582,8 +607,10 @@ import OnwardCore
     }
     func correct(_ alignment: Alignment) {
         guard let observation else { return }
+        // Only a judgment of this exact content counts as Jev's original answer.
+        let currentJudgment = lastJudgmentFingerprint == observation.fingerprint ? judgment : nil
         let entry = entries.first(where: { belongsToActiveGoal($0) && $0.observation.fingerprint == observation.fingerprint })
-            ?? ActivityEntry(goal: goal, observation: observation, judgment: judgment, goalID: activeSavedGoal?.id)
+            ?? ActivityEntry(goal: goal, observation: observation, judgment: currentJudgment, goalID: activeSavedGoal?.id)
         annotate(entry, alignment: alignment, note: "")
     }
     var activeSavedGoal: SavedGoal? { goalLibrary.goals.first { $0.id == goalLibrary.activeGoalID } }
@@ -675,9 +702,15 @@ import OnwardCore
                 try library.updateAnnotation(id: existing.id, alignment: alignment, note: note)
             } else {
                 _ = try library.addAnnotation(goalID: active.id, alignment: alignment, note: note,
-                                              observation: entry.observation, activityID: entry.id)
+                                              observation: entry.observation, activityID: entry.id,
+                                              originalJudgment: entry.judgment)
             }
             guard persistGoals(library) else { return }
+            // Labeling is an explicit request to keep this example, even with history off.
+            if saveScreenshots, let latestScreenshot, latestScreenshot.fingerprint == entry.observation.fingerprint,
+               screenshotStore?.contains(entry.observation.id) == false {
+                saveScreenshot(latestScreenshot.jpeg, for: entry.observation.id)
+            }
             if let index = entries.firstIndex(where: { $0.id == entry.id }) { entries[index].correction = alignment }
             resetEvidence(); needsCapture = true
         } catch { knowledgeError = error.localizedDescription }
@@ -700,9 +733,46 @@ import OnwardCore
             resetEvidence()
         } catch { knowledgeError = error.localizedDescription }
     }
-    private func record(_ entry: ActivityEntry) {
+    private func record(_ entry: ActivityEntry, screenshot: Data? = nil) {
         entries.insert(entry, at: 0); entries = Array(entries.prefix(150))
-        if saveHistory { do { try AppStorage.append(entry) } catch { self.error = "Could not save local history: \(error.localizedDescription)" } }
+        guard saveHistory else { return }
+        do { try AppStorage.append(entry) } catch { self.error = "Could not save local history: \(error.localizedDescription)"; return }
+        if saveScreenshots, let screenshot { saveScreenshot(screenshot, for: entry.observation.id) }
+    }
+    /// Disk failures are reported separately and never change the focus judgment.
+    private func saveScreenshot(_ jpeg: Data, for observationID: UUID) {
+        guard let store = screenshotStore else { return }
+        let learned = Set(goalLibrary.annotations.map(\.observation.id))
+        Task { [weak self, screenshotWriter] in
+            do {
+                try await screenshotWriter.save(jpeg, for: observationID, learned: learned, in: store)
+                self?.screenshotError = nil
+            } catch {
+                self?.screenshotError = "Could not save a review screenshot: \(error.localizedDescription)"
+            }
+        }
+    }
+    /// Loads a saved review image without blocking the main actor.
+    func screenshotData(for observationID: UUID) async -> Data? {
+        if let fixture = previewScreenshots[observationID] { return fixture }
+        guard let url = screenshotStore?.url(for: observationID) else { return nil }
+        return await Task.detached(priority: .userInitiated) { try? Data(contentsOf: url, options: .mappedIfSafe) }.value
+    }
+    /// Synthetic offscreen QA only; never used with persistent stores.
+    func setReviewScreenshotFixture(_ jpeg: Data, for observationID: UUID) {
+        guard goalStore == nil else { return }
+        previewScreenshots[observationID] = jpeg
+    }
+    /// Recovers Jev's answer for older examples from their exact retained activity entry.
+    private func restoreOriginalJudgments() {
+        let pending = Set(goalLibrary.annotations.filter { $0.originalJudgment == nil }.compactMap(\.activityID))
+        guard !pending.isEmpty else { return }
+        Task { [weak self] in
+            let retained = await Task.detached(priority: .utility) { AppStorage.retainedJudgments(for: pending) }.value
+            guard let self, !retained.isEmpty else { return }
+            var library = self.goalLibrary
+            if library.restoreOriginalJudgments(retained) > 0 { self.persistGoals(library) }
+        }
     }
     func saveKey(_ key: String) {
         do { try Credentials.save(key); apiKey = key.trimmingCharacters(in: .whitespacesAndNewlines); hasKey = !apiKey.isEmpty; error = nil; resetEvidence() }

@@ -430,11 +430,17 @@ struct SettingsView: View {
             SettingsSection(title: "Capture") {
                 VStack(alignment: .leading, spacing: 6) {
                     SettingsToggle(title: "Local OCR with Apple Vision", isOn: $model.ocrEnabled)
-                    Text("Screenshots stay on this Mac. Only extracted text is sent to Jev.")
+                    Text("Window images stay on this Mac. Only extracted text is sent to Jev.")
                         .font(.system(size: 12)).foregroundStyle(muted)
                 }
                 SettingsToggle(title: "Read browser page text", isOn: $model.browserTextEnabled)
                 SettingsToggle(title: "Save text observations locally", isOn: $model.saveHistory)
+                VStack(alignment: .leading, spacing: 6) {
+                    SettingsToggle(title: "Save window screenshots for Review", isOn: $model.saveScreenshots)
+                    Text("Keeps an image of the focused window for each saved observation and learned example, so Review shows what you were looking at. Stored only on this Mac; Jev never receives images.")
+                        .font(.system(size: 12)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true).lineSpacing(2)
+                    if let error = model.screenshotError { InlineNotice(message: error) }
+                }
                 HStack(spacing: 10) {
                     Button(model.accessibilityGranted ? "App text enabled" : "Enable app text", action: model.requestAccessibility)
                     Button(model.screenGranted ? "OCR permission enabled" : "Enable local OCR", action: model.requestScreenRecording)

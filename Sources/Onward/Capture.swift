@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import ScreenCaptureKit
 import Vision
+import ImageIO
 import OnwardCore
 
 enum AXRead {
@@ -194,7 +195,11 @@ enum CaptureEngine {
         case surfaceChanged
         var errorDescription: String? { "The focused app, window, or tab changed during capture. Waiting for a stable view." }
     }
-    static func capture(pid: Int32, name: String, bundleID: String, ocr: Bool, pageText: Bool) async throws -> Observation {
+    struct Result: Sendable { let observation: Observation; let screenshotJPEG: Data? }
+    /// `reuseScreenshotFingerprint` skips an extra window image when native text proves the
+    /// surface is unchanged; the caller keeps the image it already holds for that fingerprint.
+    static func capture(pid: Int32, name: String, bundleID: String, ocr: Bool, pageText: Bool,
+                        screenshot: Bool = false, reuseScreenshotFingerprint: String? = nil) async throws -> Result {
         let start = Date()
         let initialWindow = AXRead.focusedWindow(pid: pid)
         let initialTitle = initialWindow.map { AXRead.text(AXRead.value($0, kAXTitleAttribute)) }
@@ -205,18 +210,43 @@ enum CaptureEngine {
         let nativeTextIsSufficient = AXRead.capture(pid: pid, into: &observation)
         let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let windows = info.filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid && ($0[kCGWindowLayer as String] as? Int) == 0 }
-        let selected = windows.first(where: { !$0.isEmpty && ($0[kCGWindowName as String] as? String) == observation.windowTitle }) ?? windows.first
+        // Same-title windows are common (two browser windows, two documents). The AX focused
+        // window's frame identifies the actual one; title alone is a weaker fallback.
+        let axFrame = initialWindow.flatMap { window -> CGRect? in
+            guard let position = AXRead.value(window, kAXPositionAttribute), let size = AXRead.value(window, kAXSizeAttribute) else { return nil }
+            return NativeAccessibility.frame(position: position, size: size)
+        }
+        func matchesFrame(_ window: [String: Any]) -> Bool {
+            guard let axFrame, let bounds = (window[kCGWindowBounds as String] as? NSDictionary)
+                .flatMap({ CGRect(dictionaryRepresentation: $0 as CFDictionary) }) else { return false }
+            return abs(bounds.minX - axFrame.minX) <= 2 && abs(bounds.minY - axFrame.minY) <= 2 &&
+                abs(bounds.width - axFrame.width) <= 2 && abs(bounds.height - axFrame.height) <= 2
+        }
+        let titled = observation.windowTitle.isEmpty ? [] : windows.filter { ($0[kCGWindowName as String] as? String) == observation.windowTitle }
+        let verified = titled.first(where: matchesFrame) ?? windows.first(where: matchesFrame) ?? (titled.count == 1 ? titled.first : nil)
+        let selected = verified ?? titled.first ?? windows.first
         observation.windowID = selected?[kCGWindowNumber as String] as? UInt32
         if observation.windowTitle.isEmpty { observation.windowTitle = selected?[kCGWindowName as String] as? String ?? "" }
-        if ocr && !nativeTextIsSufficient {
+        var screenshotJPEG: Data?
+        let needsOCR = ocr && !nativeTextIsSufficient
+        // Review images must show the focused window, not a same-app guess.
+        let wantsScreenshot = screenshot && verified != nil &&
+            (needsOCR || reuseScreenshotFingerprint == nil || observation.fingerprint != reuseScreenshotFingerprint)
+        if wantsScreenshot || needsOCR {
             if CGPreflightScreenCaptureAccess() {
                 do {
-                    let evidence = try await LocalOCR.readWindow(pid: pid, windowID: observation.windowID, bundleID: bundleID)
-                    observation.ocrText = evidence.text; observation.ocrLayout = evidence.layout
-                    if observation.activeWorkspace == nil { observation.activeWorkspace = evidence.activeWorkspace }
-                    if !observation.ocrText.isEmpty { observation.sources.append("Local OCR · Apple Vision") }
-                } catch { observation.warnings.append("Local OCR: \(error.localizedDescription)") }
-            } else { observation.warnings.append("Screen Recording permission is needed for local OCR.") }
+                    let image = try await LocalOCR.captureWindow(pid: pid, windowID: observation.windowID)
+                    if needsOCR {
+                        let evidence = try LocalOCR.recognizeEvidence(image, bundleID: bundleID)
+                        observation.ocrText = evidence.text; observation.ocrLayout = evidence.layout
+                        if observation.activeWorkspace == nil { observation.activeWorkspace = evidence.activeWorkspace }
+                        if !observation.ocrText.isEmpty { observation.sources.append("Local OCR · Apple Vision") }
+                    }
+                    if wantsScreenshot, observation.fingerprint != reuseScreenshotFingerprint {
+                        screenshotJPEG = WindowScreenshot.jpeg(image)
+                    }
+                } catch { observation.warnings.append("Window image unavailable: \(error.localizedDescription)") }
+            } else { observation.warnings.append("Screen Recording permission is needed for local OCR and review screenshots.") }
         }
         // Reject a mixed observation if focus changed while another source was read.
         let finalWindow = AXRead.focusedWindow(pid: pid)
@@ -236,23 +266,22 @@ enum CaptureEngine {
         guard sameApp, sameWindow, sameTab else { throw Failure.surfaceChanged }
         observation.captureMilliseconds = Int(Date().timeIntervalSince(start) * 1000)
         observation.capturedAt = start
-        return observation
+        return Result(observation: observation, screenshotJPEG: screenshotJPEG)
     }
 }
 
 enum LocalOCR {
     enum Failure: LocalizedError { case noWindow; var errorDescription: String? { "No visible window could be captured." } }
-    static func readWindow(pid: Int32, windowID: UInt32?, bundleID: String) async throws -> OCRCaptureEvidence {
+    static func captureWindow(pid: Int32, windowID: UInt32?) async throws -> CGImage {
         let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
         let candidates = content.windows.filter { $0.owningApplication?.processID == pid && $0.windowLayer == 0 && $0.frame.width > 40 && $0.frame.height > 40 }
-        guard let window = candidates.first(where: { $0.windowID == windowID }) ?? candidates.first else { throw Failure.noWindow }
+        guard let windowID, let window = candidates.first(where: { $0.windowID == windowID }) else { throw Failure.noWindow }
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let config = SCStreamConfiguration()
         let scale = min(2.0, 2800 / max(window.frame.width, window.frame.height))
         config.width = max(1, Int(window.frame.width * scale)); config.height = max(1, Int(window.frame.height * scale))
         config.showsCursor = false
-        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        return try recognizeEvidence(image, bundleID: bundleID)
+        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
     }
     static func recognize(_ image: CGImage) throws -> String {
         try recognizeEvidence(image, bundleID: "").text
@@ -271,7 +300,25 @@ enum LocalOCR {
             return OCRTextLine(text: candidate.string, x: box.minX, y: 1 - box.maxY,
                                width: box.width, height: box.height, confidence: Double(candidate.confidence))
         }
-        // Images never leave this function and are never written to disk or sent to Jev.
+        // Only recognized text is used by Jev. Review screenshots are stored separately on this Mac.
         return OCRLayout.analyze(lines, bundleID: bundleID)
+    }
+}
+
+/// Encode once off the main actor; keep review images readable but bounded.
+enum WindowScreenshot {
+    static func jpeg(_ image: CGImage) -> Data? {
+        let scale = min(1, 1600 / Double(max(image.width, image.height)))
+        let width = max(1, Int(Double(image.width) * scale)), height = max(1, Int(Double(image.height) * scale))
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let resized = context.makeImage() else { return nil }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, resized, [kCGImageDestinationLossyCompressionQuality: 0.76] as CFDictionary)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 }

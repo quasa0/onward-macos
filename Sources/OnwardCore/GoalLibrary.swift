@@ -23,12 +23,14 @@ public struct GoalAnnotation: Codable, Identifiable, Equatable, Sendable {
     public var note: String
     public var observation: Observation
     public var activityID: UUID?
+    public var originalJudgment: Judgment?
 
     public init(id: UUID = UUID(), goalID: UUID, createdAt: Date = Date(), alignment: Alignment,
-                note: String, observation: Observation, activityID: UUID? = nil) {
+                note: String, observation: Observation, activityID: UUID? = nil, originalJudgment: Judgment? = nil) {
         self.id = id; self.goalID = goalID; self.createdAt = createdAt
         self.alignment = alignment; self.note = note.trimmingCharacters(in: .whitespacesAndNewlines)
         self.observation = Self.boundedObservation(observation); self.activityID = activityID
+        self.originalJudgment = originalJudgment
     }
 
     /// A durable copy, independent of the rotating activity history and OCR layout.
@@ -60,6 +62,36 @@ public struct GoalAnnotation: Codable, Identifiable, Equatable, Sendable {
         copy.warnings = copy.warnings.prefix(5).map { boundedText($0, bytes: 250) }
         return copy
     }
+}
+
+extension Alignment {
+    /// Relevant/irrelevant category for review. `nil` means Jev was unsure.
+    public var isRelevant: Bool? {
+        switch self {
+        case .onGoal, .supporting: return true
+        case .offGoal: return false
+        case .unclear: return nil
+        }
+    }
+}
+
+/// How the user's saved answer relates to Jev's original answer for the same activity.
+public enum ReviewProvenance: Equatable, Sendable {
+    case confirmed, corrected, decidedWhileUnsure, unknown
+    public init(original: Judgment?, answer: Alignment) {
+        guard let original else { self = .unknown; return }
+        guard let jev = original.alignment.isRelevant, let user = answer.isRelevant else {
+            self = original.alignment == .unclear ? .decidedWhileUnsure : .unknown; return
+        }
+        self = jev == user ? .confirmed : .corrected
+    }
+}
+
+/// Jev's recorded answer for one retained activity entry.
+public struct RetainedJudgment: Equatable, Sendable {
+    public var observationID: UUID
+    public var judgment: Judgment
+    public init(observationID: UUID, judgment: Judgment) { self.observationID = observationID; self.judgment = judgment }
 }
 
 public enum GoalLibraryError: LocalizedError, Equatable {
@@ -123,12 +155,12 @@ public struct GoalLibrary: Codable, Equatable, Sendable {
     }
 
     @discardableResult public mutating func addAnnotation(goalID: UUID, alignment: Alignment, note: String,
-                                                         observation: Observation, activityID: UUID? = nil,
+                                                         observation: Observation, activityID: UUID? = nil, originalJudgment: Judgment? = nil,
                                                          at now: Date = Date()) throws -> GoalAnnotation {
         guard goals.contains(where: { $0.id == goalID }) else { throw GoalLibraryError.goalNotFound }
         guard note.utf8.count <= 16000 else { throw GoalLibraryError.textTooLong }
         let annotation = GoalAnnotation(goalID: goalID, createdAt: now, alignment: alignment,
-                                        note: note, observation: observation, activityID: activityID)
+                                        note: note, observation: observation, activityID: activityID, originalJudgment: originalJudgment)
         annotations.append(annotation)
         return annotation
     }
@@ -138,6 +170,18 @@ public struct GoalLibrary: Codable, Equatable, Sendable {
         guard note.utf8.count <= 16000 else { throw GoalLibraryError.textTooLong }
         annotations[index].alignment = alignment
         annotations[index].note = note.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Fills a missing original answer only from the exact activity entry the example came from.
+    /// A user's label is never used to infer what Jev said.
+    @discardableResult public mutating func restoreOriginalJudgments(_ retained: [UUID: RetainedJudgment]) -> Int {
+        var restored = 0
+        for index in annotations.indices where annotations[index].originalJudgment == nil {
+            guard let activityID = annotations[index].activityID, let match = retained[activityID],
+                  match.observationID == annotations[index].observation.id else { continue }
+            annotations[index].originalJudgment = match.judgment; restored += 1
+        }
+        return restored
     }
 
     public mutating func removeAnnotation(_ id: UUID) throws {

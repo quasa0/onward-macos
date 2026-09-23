@@ -167,3 +167,64 @@ final class GoalLibraryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: store.url), corrupt)
     }
 }
+
+final class ReviewProvenanceTests: XCTestCase {
+    private func judgment(_ alignment: Alignment) -> Judgment {
+        Judgment(alignment: alignment, probabilities: [alignment.rawValue: 0.8], confidence: 0.8)
+    }
+
+    func testCompareRelevanceCategoriesNotExactLabels() {
+        XCTAssertEqual(ReviewProvenance(original: judgment(.supporting), answer: .onGoal), .confirmed)
+        XCTAssertEqual(ReviewProvenance(original: judgment(.offGoal), answer: .offGoal), .confirmed)
+        XCTAssertEqual(ReviewProvenance(original: judgment(.onGoal), answer: .offGoal), .corrected)
+        XCTAssertEqual(ReviewProvenance(original: judgment(.offGoal), answer: .supporting), .corrected)
+        XCTAssertEqual(ReviewProvenance(original: judgment(.unclear), answer: .onGoal), .decidedWhileUnsure)
+        XCTAssertEqual(ReviewProvenance(original: nil, answer: .offGoal), .unknown)
+    }
+
+    func testOriginalJudgmentPersistsSurvivesEditsAndOlderFilesDecode() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("onward-goals-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var library = GoalLibrary()
+        let goal = try library.saveGoal(title: "A", goal: "Work on A", context: "")
+        var observation = Observation(); observation.appName = "Editor"; observation.windowTitle = "Doc"
+        let original = judgment(.onGoal)
+        let saved = try library.addAnnotation(goalID: goal.id, alignment: .onGoal, note: "", observation: observation,
+                                              activityID: UUID(), originalJudgment: original)
+        try library.updateAnnotation(id: saved.id, alignment: .offGoal, note: "Actually unrelated")
+        let store = GoalLibraryFileStore(url: url)
+        try store.save(library)
+        let loaded = try XCTUnwrap(try store.load())
+        XCTAssertEqual(loaded.annotations.first?.originalJudgment, original)
+        XCTAssertEqual(loaded.annotations.first?.alignment, .offGoal)
+        XCTAssertEqual(loaded.annotations.first?.observation.id, observation.id)
+
+        // Files written before this field existed must still load, with an unknown original answer.
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        var annotations = try XCTUnwrap(json["annotations"] as? [[String: Any]])
+        annotations[0].removeValue(forKey: "originalJudgment"); json["annotations"] = annotations
+        try JSONSerialization.data(withJSONObject: json).write(to: url)
+        XCTAssertNil(try XCTUnwrap(try store.load()).annotations.first?.originalJudgment)
+    }
+
+    func testRestoreUsesOnlyTheExactRetainedActivity() throws {
+        var library = GoalLibrary()
+        let goal = try library.saveGoal(title: "A", goal: "Work on A", context: "")
+        let observation = Observation(), other = Observation()
+        let activity = UUID(), unrelatedActivity = UUID()
+        let target = try library.addAnnotation(goalID: goal.id, alignment: .offGoal, note: "", observation: observation, activityID: activity)
+        _ = try library.addAnnotation(goalID: goal.id, alignment: .onGoal, note: "", observation: other, activityID: unrelatedActivity)
+        let known = try library.addAnnotation(goalID: goal.id, alignment: .onGoal, note: "", observation: Observation(),
+                                              activityID: UUID(), originalJudgment: judgment(.onGoal))
+        let restored = library.restoreOriginalJudgments([
+            activity: RetainedJudgment(observationID: observation.id, judgment: judgment(.onGoal)),
+            // Same activity ID with a different observation must not attach.
+            unrelatedActivity: RetainedJudgment(observationID: UUID(), judgment: judgment(.offGoal)),
+            known.activityID!: RetainedJudgment(observationID: known.observation.id, judgment: judgment(.offGoal))
+        ])
+        XCTAssertEqual(restored, 1)
+        XCTAssertEqual(library.annotations.first { $0.id == target.id }?.originalJudgment?.alignment, .onGoal)
+        XCTAssertNil(library.annotations.first { $0.activityID == unrelatedActivity }?.originalJudgment)
+        XCTAssertEqual(library.annotations.first { $0.id == known.id }?.originalJudgment?.alignment, .onGoal)
+    }
+}

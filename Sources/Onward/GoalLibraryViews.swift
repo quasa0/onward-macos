@@ -1,4 +1,5 @@
 import SwiftUI
+import ImageIO
 import OnwardCore
 
 extension Notification.Name {
@@ -190,7 +191,7 @@ struct ReviewView: View {
         VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Review").font(.system(size: 28, weight: .semibold))
-                Text("Teach Onward what is relevant. Your examples guide future judgments for this goal.")
+                Text("Check Jev's answers. Confirm or correct each one; your answers guide future judgments for this goal.")
                     .font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if let activeGoal = model.activeSavedGoal {
@@ -206,6 +207,7 @@ struct ReviewView: View {
                     }
                 }.padding(16).background(libraryAccent.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
                 if let error = model.knowledgeError { InlineNotice(message: error) }
+                if let error = model.screenshotError { InlineNotice(message: error) }
                 reviewControls
                 if let savedMessage {
                     HStack {
@@ -260,11 +262,11 @@ struct ReviewView: View {
                 .padding(.vertical, 24)
         } else {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Uncertain judgments appear first. A note is optional.")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                Text("Unsure answers appear first. Green means Jev judged it relevant, red irrelevant, amber unsure.")
+                    .font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 LazyVStack(spacing: 14) {
                     ForEach(pending) { entry in
-                        ActivityReviewCard(entry: entry, goalTitle: goal.title) { alignment, note in
+                        ActivityReviewCard(model: model, entry: entry, goalTitle: goal.title) { alignment, note in
                             model.annotate(entry, alignment: alignment, note: note)
                             if model.knowledgeError == nil { savedMessage = "Example saved for \(goal.title)." }
                         }
@@ -296,38 +298,117 @@ struct ReviewView: View {
     }
 }
 
+/// Colors and words for one answer. Every state has a label and symbol, not color alone.
+private struct VerdictStyle {
+    let title: String
+    let symbol: String
+    let color: Color
+
+    // Lighter tones in dark mode keep large colored text readable on a tinted surface.
+    private static func adaptive(light: (CGFloat, CGFloat, CGFloat), dark: (CGFloat, CGFloat, CGFloat)) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let rgb = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            return NSColor(red: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
+        })
+    }
+    static let relevantColor = adaptive(light: (0.07, 0.49, 0.29), dark: (0.33, 0.80, 0.52))
+    static let irrelevantColor = adaptive(light: (0.79, 0.19, 0.19), dark: (0.98, 0.45, 0.42))
+    static let unsureColor = adaptive(light: (0.66, 0.43, 0.0), dark: (0.98, 0.75, 0.14))
+
+    init(_ alignment: OnwardCore.Alignment?) {
+        switch alignment {
+        case .onGoal: self.init(title: "Relevant", symbol: "checkmark.circle.fill", color: Self.relevantColor)
+        case .supporting: self.init(title: "Relevant · supporting", symbol: "checkmark.circle.fill", color: Self.relevantColor)
+        case .offGoal: self.init(title: "Irrelevant", symbol: "xmark.circle.fill", color: Self.irrelevantColor)
+        case .unclear, .none: self.init(title: "Unsure", symbol: "questionmark.circle.fill", color: Self.unsureColor)
+        }
+    }
+    private init(title: String, symbol: String, color: Color) { self.title = title; self.symbol = symbol; self.color = color }
+}
+
+/// The one answer a card is about, large enough to read at a glance.
+private struct VerdictBanner<Trailing: View>: View {
+    let caption: String
+    let style: VerdictStyle
+    @ViewBuilder var trailing: Trailing
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: style.symbol).font(.system(size: 30, weight: .semibold))
+                .foregroundStyle(style.color).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(caption).font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                Text(style.title).font(.system(size: 22, weight: .semibold)).foregroundStyle(style.color)
+            }
+            Spacer(minLength: 12)
+            trailing
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(style.color.opacity(0.11), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(style.color.opacity(0.32), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct ProbabilityLabel: View {
+    let judgment: Judgment
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text("\(Int((judgment.probability * 100).rounded()))%").font(.system(size: 17, weight: .medium)).monospacedDigit()
+            Text("Jev's probability").font(.system(size: 11)).foregroundStyle(.secondary)
+        }.accessibilityLabel("Jev's probability \(Int((judgment.probability * 100).rounded())) percent")
+    }
+}
+
 private struct ActivityReviewCard: View {
+    @ObservedObject var model: ObserverModel
     let entry: ActivityEntry
     let goalTitle: String
     let annotate: (OnwardCore.Alignment, String) -> Void
     @State private var note = ""
-    private var unsure: Bool { entry.judgment == nil || entry.judgment?.alignment == .unclear }
+
+    private var jevRelevant: Bool? { entry.judgment?.alignment.isRelevant }
 
     var body: some View {
         Card {
-            VStack(alignment: .leading, spacing: 16) {
-                CapturedActivitySummary(observation: entry.observation, date: entry.date)
-                HStack(spacing: 7) {
-                    Image(systemName: unsure ? "questionmark.circle.fill" : "sparkle")
-                    Text(unsure ? "Jev is unsure — your answer helps" : "Jev: \(entry.judgment?.alignment.label ?? "Observed")")
-                        .fontWeight(unsure ? .medium : .regular)
-                    if let judgment = entry.judgment, !unsure {
-                        Spacer()
-                        Text("\(Int(judgment.probability * 100))%").monospacedDigit()
-                    }
-                }.font(.system(size: 12)).foregroundStyle(unsure ? Color.primary : .secondary)
-                TextField("Optional note: why does this belong, or not?", text: $note, axis: .vertical)
-                    .textFieldStyle(.roundedBorder).lineLimit(1...4)
-                    .accessibilityLabel("Optional explanation for \(entry.observation.appName)")
-                HStack(spacing: 10) {
-                    Text("For \(goalTitle)").font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
-                    Spacer(minLength: 12)
-                    Button("Relevant", systemImage: "checkmark") { annotate(.onGoal, note) }.buttonStyle(.bordered)
-                    Button("Irrelevant", systemImage: "xmark") { annotate(.offGoal, note) }.buttonStyle(.bordered)
+            VStack(alignment: .leading, spacing: 18) {
+                VerdictBanner(caption: "Jev's answer for \(goalTitle)", style: VerdictStyle(entry.judgment?.alignment)) {
+                    if let judgment = entry.judgment, jevRelevant != nil { ProbabilityLabel(judgment: judgment) }
+                }
+                ActivityIdentity(model: model, observation: entry.observation, date: entry.date)
+                Divider()
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(jevRelevant == nil ? "Jev was unsure. Is this relevant to \(goalTitle)?" : "Was Jev right?")
+                        .font(.system(size: 16, weight: .semibold))
+                    TextField("Optional note: why does this belong, or not?", text: $note, axis: .vertical)
+                        .textFieldStyle(.roundedBorder).lineLimit(1...4)
+                        .accessibilityLabel("Optional explanation for \(entry.observation.appName)")
+                    HStack(spacing: 10) {
+                        Spacer(minLength: 0)
+                        answerButtons
+                    }.controlSize(.large)
                 }
                 CapturedTextDisclosure(observation: entry.observation)
             }
-        }.overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(unsure ? Color.orange.opacity(0.4) : .clear, lineWidth: 1))
+        }
+    }
+
+    @ViewBuilder private var answerButtons: some View {
+        if let relevant = jevRelevant {
+            // Confirming keeps Jev's exact category; correcting names the saved answer.
+            Button { annotate(relevant ? .offGoal : .onGoal, note) } label: {
+                Label(relevant ? "Wrong — it's irrelevant" : "Wrong — it's relevant", systemImage: "hand.thumbsdown")
+            }.buttonStyle(.bordered)
+            Button { annotate(entry.judgment?.alignment ?? .onGoal, note) } label: {
+                Label("Jev was right", systemImage: "hand.thumbsup.fill")
+            }.buttonStyle(.borderedProminent).tint(VerdictStyle(entry.judgment?.alignment).color)
+                .accessibilityHint(relevant ? "Saves this activity as relevant" : "Saves this activity as irrelevant")
+        } else {
+            Button { annotate(.offGoal, note) } label: { Label("Irrelevant", systemImage: "xmark") }
+                .buttonStyle(.borderedProminent).tint(VerdictStyle.irrelevantColor)
+            Button { annotate(.onGoal, note) } label: { Label("Relevant", systemImage: "checkmark") }
+                .buttonStyle(.borderedProminent).tint(VerdictStyle.relevantColor)
+        }
     }
 }
 
@@ -339,41 +420,70 @@ private struct LearnedExampleCard: View {
     @State private var note = ""
     @State private var alignment: OnwardCore.Alignment = .onGoal
 
-    private var relevant: Bool { annotation.alignment == .onGoal || annotation.alignment == .supporting }
-    private var label: String {
-        annotation.alignment == .unclear ? "Needs review for \(goalTitle)" : "\(relevant ? "Relevant" : "Irrelevant") to \(goalTitle)"
+    private var relevant: Bool { annotation.alignment.isRelevant == true }
+    private var provenance: ReviewProvenance { ReviewProvenance(original: annotation.originalJudgment, answer: annotation.alignment) }
+    private var provenanceText: (String, String) {
+        switch provenance {
+        case .confirmed: return ("You confirmed Jev", "hand.thumbsup.fill")
+        case .corrected: return ("You corrected Jev", "arrow.uturn.backward.circle.fill")
+        case .decidedWhileUnsure: return ("Jev was unsure; you decided", "person.fill.checkmark")
+        case .unknown: return ("Jev's original answer was not recorded", "clock.badge.questionmark")
+        }
     }
 
     var body: some View {
         Card {
-            VStack(alignment: .leading, spacing: 14) {
-                CapturedActivitySummary(observation: annotation.observation, date: annotation.createdAt)
-                HStack {
-                    Label(label, systemImage: annotation.alignment == .unclear ? "questionmark.circle" : relevant ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(relevant ? libraryAccent : .primary)
-                    Spacer()
-                    if !editing {
-                        Button("Edit") { note = annotation.note; alignment = relevant ? .onGoal : .offGoal; editing = true }
-                    }
+            VStack(alignment: .leading, spacing: 18) {
+                VerdictBanner(caption: "Your answer for \(goalTitle)", style: VerdictStyle(annotation.alignment == .unclear ? nil : annotation.alignment)) {
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Label(provenanceText.0, systemImage: provenanceText.1).font(.system(size: 13, weight: .medium))
+                        if let original = annotation.originalJudgment {
+                            let jev = VerdictStyle(original.alignment)
+                            HStack(spacing: 4) {
+                                Text("Jev said")
+                                Image(systemName: jev.symbol).foregroundStyle(jev.color).accessibilityHidden(true)
+                                Text(jev.title).fontWeight(.medium).foregroundStyle(jev.color)
+                                if original.alignment != .unclear {
+                                    Text("· \(Int((original.probability * 100).rounded()))%").monospacedDigit()
+                                }
+                            }.font(.system(size: 12)).foregroundStyle(.secondary)
+                        }
+                    }.multilineTextAlignment(.trailing)
                 }
+                ActivityIdentity(model: model, observation: annotation.observation, date: annotation.createdAt)
                 if editing {
-                    Picker("Relevance", selection: $alignment) {
-                        Text("Relevant").tag(OnwardCore.Alignment.onGoal)
-                        Text("Irrelevant").tag(OnwardCore.Alignment.offGoal)
-                    }.pickerStyle(.segmented)
-                    TextField("Why this belongs, or not (optional)", text: $note, axis: .vertical)
-                        .textFieldStyle(.roundedBorder).lineLimit(2...5).accessibilityLabel("Example note")
-                    HStack {
-                        Button("Remove example", role: .destructive) { model.removeAnnotation(annotation.id) }
-                        Spacer()
-                        Button("Cancel") { editing = false }
-                        Button("Save changes") {
-                            model.updateAnnotation(annotation.id, alignment: alignment, note: note)
-                            if model.knowledgeError == nil { editing = false }
-                        }.buttonStyle(.borderedProminent)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Picker("Your answer", selection: $alignment) {
+                            Text("Relevant").tag(OnwardCore.Alignment.onGoal)
+                            Text("Irrelevant").tag(OnwardCore.Alignment.offGoal)
+                        }.pickerStyle(.segmented)
+                        TextField("Why this belongs, or not (optional)", text: $note, axis: .vertical)
+                            .textFieldStyle(.roundedBorder).lineLimit(2...5).accessibilityLabel("Example note")
+                        HStack {
+                            Button("Remove example", role: .destructive) { model.removeAnnotation(annotation.id) }
+                            Spacer()
+                            Button("Cancel") { editing = false }
+                            Button("Save changes") {
+                                // Keep the saved category (including "supporting") unless the answer changed.
+                                let answer = annotation.alignment.isRelevant == (alignment == .onGoal) ? annotation.alignment : alignment
+                                model.updateAnnotation(annotation.id, alignment: answer, note: note)
+                                if model.knowledgeError == nil { editing = false }
+                            }.buttonStyle(.borderedProminent)
+                        }
                     }
-                } else if !annotation.note.isEmpty {
-                    Text(annotation.note).font(.system(size: 13)).lineSpacing(2).textSelection(.enabled)
+                } else {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        if annotation.note.isEmpty {
+                            Text("No note").font(.system(size: 13)).foregroundStyle(.tertiary)
+                        } else {
+                            Text(annotation.note).font(.system(size: 14)).lineSpacing(2).textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 12)
+                        Button("Change answer or note") {
+                            note = annotation.note; alignment = relevant ? .onGoal : .offGoal; editing = true
+                        }
+                    }
                 }
                 CapturedTextDisclosure(observation: annotation.observation)
             }
@@ -381,31 +491,140 @@ private struct LearnedExampleCard: View {
     }
 }
 
-private struct CapturedActivitySummary: View {
+/// Screenshot first, then the most specific name for the activity.
+private struct ActivityIdentity: View {
+    @ObservedObject var model: ObserverModel
     let observation: Observation
     let date: Date
 
-    var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            appIcon(observation.bundleID).frame(width: 30, height: 30).accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(observation.appName).font(.system(size: 13, weight: .semibold))
-                    Spacer(minLength: 12)
-                    Text(date.formatted(date: .abbreviated, time: .shortened)).font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
-                }
-                if let workspace = observation.activeWorkspace {
-                    Text([workspace.project, workspace.thread].filter { !$0.isEmpty }.joined(separator: " / "))
-                        .font(.system(size: 14, weight: .medium)).lineLimit(3)
-                } else {
-                    Text(observation.tabTitle.isEmpty ? observation.windowTitle : observation.tabTitle)
-                        .font(.system(size: 14, weight: .medium)).lineLimit(3)
-                }
-                if !observation.url.isEmpty {
-                    Text(observation.url).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).lineLimit(2)
-                }
-            }.textSelection(.enabled)
+    private var title: String {
+        if let workspace = observation.activeWorkspace {
+            let parts = [workspace.project, workspace.thread].filter { !$0.isEmpty }
+            if !parts.isEmpty { return parts.joined(separator: " / ") }
         }
+        let title = observation.tabTitle.isEmpty ? observation.windowTitle : observation.tabTitle
+        return title.isEmpty ? observation.appName : title
+    }
+    private var host: String? { URL(string: observation.url)?.host(percentEncoded: false) }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 18) {
+            ReviewScreenshot(model: model, observationID: observation.id, title: title)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 7) {
+                    appIcon(observation.bundleID).frame(width: 20, height: 20).accessibilityHidden(true)
+                    Text(observation.appName).font(.system(size: 13, weight: .medium))
+                    if let host { Text("· \(host)").font(.system(size: 13)).foregroundStyle(.secondary).lineLimit(1) }
+                }
+                Text(title).font(.system(size: 18, weight: .semibold)).lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !observation.url.isEmpty {
+                    Text(observation.url).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle).help(observation.url)
+                }
+                Text(date.formatted(date: .abbreviated, time: .shortened)).font(.system(size: 12)).monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }.textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// Decoded thumbnails are shared across cards; NSCache is thread-safe and evicts under pressure.
+private enum ScreenshotThumbnails {
+    static let cache: NSCache<NSUUID, NSImage> = { let cache = NSCache<NSUUID, NSImage>(); cache.countLimit = 80; return cache }()
+    static func decode(_ data: Data, maxPixel: Int) -> NSImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel] as CFDictionary) else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+    }
+}
+
+private struct ReviewScreenshot: View {
+    @ObservedObject var model: ObserverModel
+    let observationID: UUID
+    let title: String
+    @State private var thumbnail: NSImage?
+    @State private var missing = false
+    @State private var enlarged = false
+    static let size = CGSize(width: 232, height: 150)
+
+    var body: some View {
+        Group {
+            if let thumbnail {
+                Button { enlarged = true } label: {
+                    Image(nsImage: thumbnail).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+                        .frame(width: Self.size.width, height: Self.size.height)
+                        .background(Color.primary.opacity(0.05))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(alignment: .bottomTrailing) {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                .font(.system(size: 11, weight: .semibold)).padding(6)
+                                .background(.regularMaterial, in: Circle()).padding(6)
+                        }
+                }.buttonStyle(.plain).help("Enlarge screenshot")
+                    .accessibilityLabel("Screenshot of \(title). Enlarge.")
+            } else {
+                VStack(spacing: 6) {
+                    if missing {
+                        Image(systemName: "photo").font(.system(size: 20)).accessibilityHidden(true)
+                        Text("No screenshot saved").font(.system(size: 12))
+                    }
+                }.foregroundStyle(.secondary)
+                    .frame(width: Self.size.width, height: Self.size.height)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.primary.opacity(0.08), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                    .accessibilityElement(children: .combine)
+            }
+        }
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.primary.opacity(thumbnail == nil ? 0 : 0.12), lineWidth: 1))
+        .task(id: observationID) { await load() }
+        .sheet(isPresented: $enlarged) { ScreenshotSheet(model: model, observationID: observationID, title: title) }
+    }
+
+    private func load() async {
+        let key = observationID as NSUUID
+        if let cached = ScreenshotThumbnails.cache.object(forKey: key) { thumbnail = cached; missing = false; return }
+        thumbnail = nil; missing = false
+        guard let data = await model.screenshotData(for: observationID) else { missing = true; return }
+        let image = await Task.detached(priority: .userInitiated) { ScreenshotThumbnails.decode(data, maxPixel: 720) }.value
+        guard !Task.isCancelled else { return }
+        if let image { ScreenshotThumbnails.cache.setObject(image, forKey: key) }
+        thumbnail = image; missing = image == nil
+    }
+}
+
+private struct ScreenshotSheet: View {
+    @ObservedObject var model: ObserverModel
+    let observationID: UUID
+    let title: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: NSImage?
+    @State private var missing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                Spacer(minLength: 16)
+                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            Group {
+                if let image {
+                    Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                } else {
+                    Text(missing ? "This screenshot is no longer saved." : "Loading…").foregroundStyle(.secondary)
+                }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            Text("Saved only on this Mac. Jev receives text, never images.").font(.system(size: 11)).foregroundStyle(.secondary)
+        }.padding(20).frame(minWidth: 760, idealWidth: 1100, minHeight: 520, idealHeight: 760)
+            .task {
+                guard let data = await model.screenshotData(for: observationID) else { missing = true; return }
+                image = await Task.detached(priority: .userInitiated) { ScreenshotThumbnails.decode(data, maxPixel: 2400) }.value
+                missing = image == nil
+            }
     }
 }
 

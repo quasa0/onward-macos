@@ -286,7 +286,7 @@ import OnwardCore
                                     "warningPulseID": warningPulseID, "recoveryPulseID": recoveryPulseID,
                                     "cameraEnabled": cameraEnabled,
                                     "cameraStatus": cameraSnapshot.status.rawValue,
-                                    "cameraCalibrated": cameraSnapshot.calibrated,
+                                    "cameraBaselineReady": cameraSnapshot.baselineReady,
                                     "cameraDistraction": cameraOverrideActive,
                                     "offGoalSeconds": offGoalSeconds,
                                     "statusTransitions": statusTransitions,
@@ -584,11 +584,11 @@ import OnwardCore
             }
         }
     }
-    func calibrateCamera() {
+    /// Saves the current head direction as "looking at the screen" (for screens far from the camera).
+    func useCurrentCameraDirection() {
         guard cameraEnabled, !sleeping else { return }
-        cameraController?.calibrate()
+        cameraController?.useCurrentDirectionAsScreen()
     }
-    func cancelCameraCalibration() { cameraController?.cancelCalibration() }
     func setCameraPreviewVisible(_ visible: Bool) {
         guard cameraPreviewVisible != visible else { return }
         cameraPreviewVisible = visible

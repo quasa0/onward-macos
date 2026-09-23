@@ -18,18 +18,16 @@ private struct CameraVisualState {
             title = "Waiting for a reading"; symbol = "questionmark.circle"; color = cameraYellow; needsAttention = true
         } else {
             switch snapshot.status {
-            case .present where snapshot.calibrated:
-                title = "Facing the screen"; symbol = "checkmark.circle.fill"; color = cameraGreen; needsAttention = false
             case .present:
-                title = "Face visible · calibrate gaze"; symbol = "viewfinder"; color = cameraYellow; needsAttention = true
+                title = "Facing the screen"; symbol = "checkmark.circle.fill"; color = cameraGreen; needsAttention = false
+            case .uncertain where !snapshot.baselineReady:
+                title = "Learning your screen direction"; symbol = "scope"; color = cameraYellow; needsAttention = true
             case .lookingAway:
                 title = snapshot.isDistracted ? "Looking away" : "Looking away · grace period"
-                symbol = "eye.slash"; color = cameraYellow; needsAttention = true
+                symbol = "arrow.turn.up.right"; color = cameraYellow; needsAttention = true
             case .absent:
-                title = snapshot.isDistracted ? "No face detected" : "No face · grace period"
+                title = snapshot.isDistracted ? "Nobody in view" : "Nobody in view · grace period"
                 symbol = "person.crop.circle.badge.questionmark"; color = cameraYellow; needsAttention = true
-            case .calibrating:
-                title = "Calibrating"; symbol = "viewfinder"; color = cameraYellow; needsAttention = true
             case .permissionNeeded:
                 title = "Camera access needed"; symbol = "lock"; color = cameraYellow; needsAttention = true
             case .unavailable:
@@ -45,7 +43,6 @@ private struct CameraVisualState {
 
 struct CameraAttentionView: View {
     @ObservedObject var model: ObserverModel
-    var calibrate: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
@@ -70,24 +67,24 @@ struct CameraAttentionView: View {
                         CameraFeedView(frame: model.cameraFrame, snapshot: model.cameraSnapshot, now: model.now,
                                        enabled: model.cameraEnabled, showsLiveLabel: true)
                         VStack(alignment: .leading, spacing: 12) {
-                            GazeDirectionView(snapshot: model.cameraSnapshot, now: model.now)
-                            Button(model.cameraSnapshot.calibrated ? "Recalibrate" : "Calibrate for this screen", systemImage: "viewfinder", action: calibrate)
-                                .buttonStyle(.borderedProminent).disabled(model.cameraPermissionPending)
-                            Text("Use the calibration dot to teach Onward your usual screen position.")
+                            HeadDirectionView(snapshot: model.cameraSnapshot, now: model.now)
+                            Button("I'm facing my screen", systemImage: "scope", action: model.useCurrentCameraDirection)
+                                .disabled(model.cameraPermissionPending)
+                            Text("Optional. Onward learns your usual direction by itself. Use this if your screen is far from the camera.")
                                 .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        }.frame(width: 180, alignment: .leading)
+                        }.frame(width: 200, alignment: .leading)
                     }
                     Text(model.cameraSnapshot.reason.isEmpty ? "Waiting for your camera." : model.cameraSnapshot.reason)
                         .font(.system(size: 13)).lineSpacing(2).fixedSize(horizontal: false, vertical: true)
                 }
-                Text("Green means you appear to face the screen. Yellow means you look away, are out of view, or the reading is uncertain. Your goal's color is separate.")
+                Text("Green means your head faces your usual screen direction. Yellow means a large turn away, nobody in view, or an uncertain reading. Eyes are not tracked. Your goal's color is separate.")
                     .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(2)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ContentUnavailableView {
                     Label(model.cameraPermissionPending ? "Waiting for camera permission" : "Camera attention is off", systemImage: "camera")
                 } description: {
-                    Text("Enable it to see your live view and calibrate approximate screen attention. Camera frames stay on this Mac and are never recorded.")
+                    Text("Enable it to see your live view and estimate whether you face your screen. Camera frames stay on this Mac and are never recorded.")
                 } actions: {
                     if model.cameraSnapshot.status == .permissionNeeded {
                         Button("Open camera settings") { model.openPrivacy("Privacy_Camera") }
@@ -106,7 +103,6 @@ struct CameraAttentionView: View {
 struct CameraPreviewCard: View {
     @ObservedObject var model: ObserverModel
     var open: () -> Void
-    var calibrate: () -> Void
 
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
@@ -115,12 +111,7 @@ struct CameraPreviewCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Camera attention").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                 CameraStatusLabel(snapshot: model.cameraSnapshot, now: model.now, enabled: model.cameraEnabled)
-                HStack(spacing: 12) {
-                    Button("Open live view", action: open).buttonStyle(.link)
-                    if !model.cameraSnapshot.calibrated {
-                        Button("Calibrate", action: calibrate).buttonStyle(.link)
-                    }
-                }.font(.system(size: 12))
+                Button("Open live view", action: open).buttonStyle(.link).font(.system(size: 12))
             }.frame(maxWidth: .infinity, alignment: .leading)
         }.padding(14).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.primary.opacity(0.08), lineWidth: 1))
@@ -184,7 +175,7 @@ struct CameraFeedView: View {
         }.aspectRatio(aspectRatio, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 9))
             .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.white.opacity(0.12), lineWidth: 1))
-            .accessibilityLabel(enabled ? "Mirrored live camera view with detected face and eye landmarks" : "Camera off")
+            .accessibilityLabel(enabled ? "Mirrored live camera view with detected face and body markers" : "Camera off")
     }
 
     @ViewBuilder private func landmarks(in size: CGSize) -> some View {
@@ -195,7 +186,7 @@ struct CameraFeedView: View {
                 .frame(width: bounds.width * size.width, height: bounds.height * size.height)
                 .position(x: (1 - bounds.midX) * size.width, y: (1 - bounds.midY) * size.height)
         }
-        ForEach(Array(snapshot.pupilPoints.enumerated()), id: \.offset) { _, point in
+        ForEach(Array(snapshot.bodyPoints.enumerated()), id: \.offset) { _, point in
             if point.x.isFinite, point.y.isFinite, (0...1).contains(point.x), (0...1).contains(point.y) {
                 Circle().fill(.white).frame(width: 5, height: 5)
                     .overlay(Circle().strokeBorder(.black.opacity(0.65), lineWidth: 1))
@@ -205,152 +196,45 @@ struct CameraFeedView: View {
     }
 }
 
-struct GazeDirectionView: View {
+/// Shows how far the head is turned and tilted from the usual screen direction. Magnitudes only:
+/// the left/right sign of Vision's yaw is not verified, so no direction is claimed.
+struct HeadDirectionView: View {
     let snapshot: CameraAttentionSnapshot
     let now: Date
 
     private var offset: CGPoint? {
-        guard snapshot.isFresh(at: now), snapshot.calibrated,
-              let point = snapshot.gazeOffset, point.x.isFinite, point.y.isFinite else { return nil }
-        return CGPoint(x: min(1, max(-1, point.x)), y: min(1, max(-1, point.y)))
+        guard snapshot.isFresh(at: now), let point = snapshot.headOffset, point.x.isFinite, point.y.isFinite else { return nil }
+        return point
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Approximate direction").font(.system(size: 12, weight: .medium))
-            GeometryReader { geometry in
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8).fill(.primary.opacity(0.035))
-                    Path { path in
-                        path.move(to: CGPoint(x: geometry.size.width / 2, y: 10))
-                        path.addLine(to: CGPoint(x: geometry.size.width / 2, y: geometry.size.height - 10))
-                        path.move(to: CGPoint(x: 10, y: geometry.size.height / 2))
-                        path.addLine(to: CGPoint(x: geometry.size.width - 10, y: geometry.size.height / 2))
-                    }.stroke(.primary.opacity(0.1), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                    Circle().strokeBorder(.primary.opacity(0.2), lineWidth: 1).frame(width: 18, height: 18)
-                    if let offset {
-                        let state = CameraVisualState(snapshot: snapshot, at: now, enabled: true)
-                        Circle().fill(state.color).frame(width: 12, height: 12)
-                            .overlay(Circle().strokeBorder(.primary.opacity(0.15), lineWidth: 1))
-                            .position(x: geometry.size.width / 2 + offset.x * (geometry.size.width / 2 - 12),
-                                      y: geometry.size.height / 2 - offset.y * (geometry.size.height / 2 - 12))
-                    }
-                }
-            }.frame(height: 90)
-            Text(offset == nil ? (snapshot.calibrated ? "No reliable direction" : "Calibrate to see direction") : "Relative to your calibration")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-            Text("Direction only, not a screen position.").font(.system(size: 11)).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Head direction").font(.system(size: 12, weight: .medium))
+            meter("Turn", value: offset.map { abs($0.x) })
+            meter("Tilt", value: offset.map { abs($0.y) })
+            Text(offset == nil ? (snapshot.baselineReady ? "No clear reading" : "Learning your usual direction")
+                 : "Past the line for 8 seconds counts as looking away")
+                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }.accessibilityElement(children: .ignore)
-            .accessibilityLabel("Approximate gaze direction")
-            .accessibilityValue(directionDescription)
+            .accessibilityLabel("Head direction")
+            .accessibilityValue(offset.map { "Turn \(Int(abs($0.x) * 100)) percent, tilt \(Int(abs($0.y) * 100)) percent of the looking-away limit" } ?? "No reading")
     }
 
-    private var directionDescription: String {
-        guard let offset else { return "No reliable direction" }
-        let horizontal = abs(offset.x) < 0.2 ? "" : offset.x > 0 ? "right" : "left"
-        let vertical = abs(offset.y) < 0.2 ? "" : offset.y > 0 ? "up" : "down"
-        let direction = [vertical, horizontal].filter { !$0.isEmpty }.joined(separator: " and ")
-        return direction.isEmpty ? "Near calibrated center" : direction
-    }
-}
-
-struct CameraCalibrationView: View {
-    @ObservedObject var model: ObserverModel
-    var automaticallyStart = true
-    @Environment(\.dismiss) private var dismiss
-    @State private var sawCalibration = false
-    @State private var attempted = false
-
-    private var snapshot: CameraAttentionSnapshot { model.cameraSnapshot }
-    private var success: Bool {
-        snapshot.calibrationProgress >= 1 && snapshot.calibrated && (sawCalibration || !automaticallyStart)
-    }
-    private var failed: Bool {
-        attempted && !success && (snapshot.status == .unavailable || snapshot.status == .permissionNeeded ||
-                                  (sawCalibration && snapshot.status != .calibrating))
-    }
-    private var progress: Double { min(1, max(0, snapshot.calibrationProgress)) }
-    private var title: String { success ? "Your screen position is calibrated" : failed ? "Let's try that again" : "Look at the dot and hold still" }
-
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                Color(nsColor: .windowBackgroundColor)
-                ZStack {
-                    Circle().strokeBorder(cameraGreen.opacity(0.13), lineWidth: 1).frame(width: 76, height: 76)
-                    Circle().strokeBorder(cameraGreen.opacity(0.3), lineWidth: 2).frame(width: 40, height: 40)
-                    if success {
-                        Image(systemName: "checkmark.circle.fill").font(.system(size: 30)).foregroundStyle(cameraGreen)
-                    } else {
-                        Circle().fill(failed ? cameraYellow : cameraGreen).frame(width: 13, height: 13)
+    /// 0 = usual direction, the marked line = looking-away limit, the bar end = 1.5× the limit.
+    private func meter(_ title: String, value: Double?) -> some View {
+        HStack(spacing: 8) {
+            Text(title).font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 30, alignment: .leading)
+            GeometryReader { geometry in
+                let width = geometry.size.width
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.primary.opacity(0.07))
+                    if let value {
+                        Capsule().fill(value >= 1 ? cameraYellow : cameraGreen)
+                            .frame(width: max(6, width * min(1, value / 1.5)))
                     }
-                }.position(x: geometry.size.width / 2, y: geometry.size.height / 2)
-                Text(success ? "Done" : failed ? "Adjust your position, then retry" : "Keep your eyes here")
-                    .font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
-                    .position(x: geometry.size.width / 2, y: geometry.size.height / 2 + 58)
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(alignment: .top) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(title).font(.system(size: 23, weight: .semibold))
-                            Text(success ? "You can close this and return to your work." : "Keep looking at the dot until it becomes a checkmark.")
-                                .font(.system(size: 13)).foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 12)
-                        if !success, let remaining = snapshot.calibrationSecondsRemaining {
-                            VStack(alignment: .trailing, spacing: 3) {
-                                Text("\(Int(max(0, remaining).rounded(.up)))s").font(.system(size: 23, weight: .medium)).monospacedDigit()
-                                Text("time left").font(.system(size: 11)).foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    Spacer()
-                    HStack(alignment: .center, spacing: 18) {
-                        CameraFeedView(frame: model.cameraFrame, snapshot: snapshot, now: model.now,
-                                       enabled: model.cameraEnabled).frame(width: 152)
-                        VStack(alignment: .leading, spacing: 9) {
-                            Text(success ? "Calibration complete" : failed ? "Calibration needs another try" : "Finding a steady view")
-                                .font(.system(size: 13, weight: .medium))
-                            Text(snapshot.reason.isEmpty ? "Keep one face visible. Adjust your camera or lighting if needed." : snapshot.reason)
-                                .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(2)
-                                .fixedSize(horizontal: false, vertical: true)
-                            ProgressView(value: success ? 1 : progress).tint(cameraGreen)
-                                .accessibilityLabel("Calibration progress")
-                                .accessibilityValue("\(Int(progress * 100)) percent")
-                        }.frame(maxWidth: .infinity, alignment: .leading)
-                    }.padding(.bottom, 20)
-                    HStack {
-                        if success {
-                            Button("Calibrate again", action: beginCalibration)
-                        } else {
-                            Button("Cancel") { model.cancelCameraCalibration(); dismiss() }.keyboardShortcut(.cancelAction)
-                        }
-                        Spacer()
-                        Text("Live on this Mac · Never recorded").font(.system(size: 11)).foregroundStyle(.secondary)
-                        Spacer()
-                        if success {
-                            Button("Done") { dismiss() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                        } else if snapshot.status == .permissionNeeded {
-                            Button("Open camera settings") { model.openPrivacy("Privacy_Camera") }.buttonStyle(.borderedProminent)
-                        } else if failed {
-                            Button("Try again", action: beginCalibration).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                        }
-                    }
-                }.padding(28)
-            }
-        }.frame(width: 690, height: 580)
-            .onAppear {
-                if automaticallyStart { beginCalibration() }
-                else { attempted = true; sawCalibration = snapshot.status == .calibrating }
-            }
-            .onChange(of: snapshot.status) { _, status in
-                if status == .calibrating { sawCalibration = true }
-            }
-            .onDisappear { if snapshot.status == .calibrating { model.cancelCameraCalibration() } }
-    }
-
-    private func beginCalibration() {
-        attempted = true; sawCalibration = false
-        model.calibrateCamera()
-        if snapshot.status == .calibrating { sawCalibration = true }
+                    Rectangle().fill(.primary.opacity(0.45)).frame(width: 1.5, height: 12).offset(x: width / 1.5 - 0.75)
+                }
+            }.frame(height: 8)
+        }
     }
 }

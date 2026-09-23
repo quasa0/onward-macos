@@ -12,9 +12,7 @@ final class CameraAttentionController {
     private var worker: CameraAttentionWorker?
     private var configuration: Configuration?
     private var generation = UUID()
-    private var calibrated = false
-    private var isCalibrating = false
-    private var calibrationCommand = CameraCalibrationCommand()
+    private var baselineReady = false
 
     private struct Configuration: Equatable {
         let enabled: Bool
@@ -48,52 +46,26 @@ final class CameraAttentionController {
         let authorized = next.authorization == .authorized
         let allowed = enabled && !suspended && authorized
         let run = allowed && (active || previewVisible)
-        if !allowed { isCalibrating = false; calibrationCommand = CameraCalibrationCommand() }
         worker?.cancelPending(generation: generation)
         if enabled && authorized && worker == nil { makeWorker() }
-        worker?.configure(generation: generation, active: allowed && active,
-                          previewVisible: allowed && previewVisible, calibration: calibrationCommand)
-        if !allowed || (!previewVisible && !isCalibrating) { onFrame?(nil) }
-        guard !run, !isCalibrating else { return }
+        worker?.configure(generation: generation, active: allowed && active, previewVisible: allowed && previewVisible)
+        if !allowed || !previewVisible { onFrame?(nil) }
+        guard !run else { return }
         if enabled && !authorized {
             onUpdate(.init(status: .permissionNeeded, reason: next.authorization == .notDetermined
                            ? "Enable camera access to use local attention detection."
                            : "Allow Camera access for Onward in System Settings."))
         } else {
             onUpdate(.init(status: .disabled, reason: enabled ? "Camera attention is paused." : "Camera attention is off.",
-                           calibrated: calibrated))
+                           baselineReady: baselineReady))
         }
     }
 
-    func calibrate() {
-        guard let configuration, configuration.enabled, !configuration.suspended,
-              AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { return }
-        generation = UUID()
-        isCalibrating = true
-        calibrationCommand = CameraCalibrationCommand(startedUptime: ProcessInfo.processInfo.systemUptime)
-        if worker == nil { makeWorker() }
-        worker?.cancelPending(generation: generation)
-        onUpdate(.init(status: .calibrating, reason: "Look at the center target and hold still.",
-                       calibrated: calibrated, calibrationSecondsRemaining: 20))
-        worker?.configure(generation: generation, active: configuration.active,
-                          previewVisible: configuration.previewVisible, calibration: calibrationCommand)
-    }
-
-    func cancelCalibration() {
-        guard isCalibrating, let configuration else { return }
-        generation = UUID(); isCalibrating = false
-        calibrationCommand = CameraCalibrationCommand()
-        worker?.configure(generation: generation, active: configuration.active && !configuration.suspended,
-                          previewVisible: configuration.previewVisible && !configuration.suspended, calibration: calibrationCommand)
-        if !configuration.previewVisible { onFrame?(nil) }
-        onUpdate(.init(status: configuration.active || configuration.previewVisible ? .uncertain : .disabled,
-                       reason: "Calibration cancelled.", calibrated: calibrated))
-    }
+    /// Replaces the learned screen direction with the user's current head direction.
+    func useCurrentDirectionAsScreen() { worker?.useCurrentDirectionAsScreen(generation: generation) }
 
     func stop() {
         configuration = nil
-        isCalibrating = false
-        calibrationCommand = CameraCalibrationCommand()
         generation = UUID()
         worker?.shutdown(generation: generation)
         worker = nil
@@ -104,8 +76,7 @@ final class CameraAttentionController {
         worker = CameraAttentionWorker(onUpdate: { [weak self] token, snapshot in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
-                self.calibrated = snapshot.calibrated
-                self.isCalibrating = snapshot.calibrationSecondsRemaining != nil
+                self.baselineReady = snapshot.baselineReady
                 self.onUpdate(snapshot)
             }
         }, onFrame: { [weak self] token, frame in
@@ -115,12 +86,6 @@ final class CameraAttentionController {
     }
 
     deinit { worker?.shutdown(generation: UUID()) }
-}
-
-/// Every mode update carries the latest request, so a superseded queued update cannot lose a start/cancel.
-private struct CameraCalibrationCommand {
-    let revision = UUID()
-    var startedUptime: TimeInterval? = nil
 }
 
 /// Coalesces preview delivery, so a busy main actor retains at most one pending image.
@@ -174,18 +139,15 @@ private final class CameraAttentionWorker: NSObject, AVCaptureVideoDataOutputSam
     private var lastCapturedUptime: TimeInterval?
     private var lastFrameAt: Date?
     private var policy = CameraAttentionPolicy()
-    private var calibration: CameraGazeCalibration?
-    private var calibrator = CameraGazeCalibrator()
-    private var calibrationStartedUptime: TimeInterval?
-    private var appliedCalibrationRevision: UUID?
-    private var calibrationCompleted = false
-    private var lastSnapshot: CameraAttentionSnapshot?
+    private var baseline = HeadPoseBaseline()
+    /// Recent reliable head poses with capture time, for "use my current direction".
+    private var recentPoses: [(Date, HeadPose)] = []
     private var lastRecoveryUptime: TimeInterval?
-    private let calibrationKey = "cameraAttention.numericCalibration.v1"
+    private let baselineKey = "cameraAttention.headBaseline.v1"
 
-    private struct StoredCalibration: Codable {
+    private struct StoredBaseline: Codable {
         let deviceID: String
-        let calibration: CameraGazeCalibration
+        let center: HeadPose
     }
 
     init(onUpdate: @escaping @Sendable (UUID, CameraAttentionSnapshot) -> Void,
@@ -204,18 +166,13 @@ private final class CameraAttentionWorker: NSObject, AVCaptureVideoDataOutputSam
         return acceptedGeneration == token
     }
 
-    func configure(generation token: UUID, active: Bool, previewVisible: Bool, calibration command: CameraCalibrationCommand) {
+    func configure(generation token: UUID, active: Bool, previewVisible: Bool) {
         cancelPending(generation: token)
         queue.async { [self] in
             guard accepts(token) else { return }
             generation = token
             self.active = active
             self.previewVisible = previewVisible
-            if appliedCalibrationRevision != command.revision {
-                appliedCalibrationRevision = command.revision
-                policy.reset(); calibrator = CameraGazeCalibrator(); calibrationCompleted = false
-                calibrationStartedUptime = command.startedUptime
-            }
             if shouldRun {
                 observeIfNeeded()
                 startSession(token: token)
@@ -232,38 +189,45 @@ private final class CameraAttentionWorker: NSObject, AVCaptureVideoDataOutputSam
         cancelPending(generation: token)
         queue.async { [self] in
             guard accepts(token) else { return }
-            generation = token; active = false; previewVisible = false; calibrationStartedUptime = nil
+            generation = token; active = false; previewVisible = false
             stopSession(); removeObservers(); policy.reset()
+        }
+    }
+
+    func useCurrentDirectionAsScreen(generation token: UUID) {
+        queue.async { [self] in
+            guard accepts(token) else { return }
+            let now = Date()
+            let recent = recentPoses.filter { now.timeIntervalSince($0.0) <= 2.5 }.map(\.1)
+            guard baseline.setCenter(from: recent) else {
+                emit(.init(status: .uncertain, reason: "Face your screen with the camera on, then try again.",
+                           baselineReady: baseline.isReady, observedAt: now))
+                return
+            }
+            saveBaseline()
+            policy.reset()
+            emit(.init(status: .uncertain, reason: "Saved your current direction as looking at the screen.",
+                       baselineReady: true, observedAt: now))
         }
     }
 
     private func emit(_ snapshot: CameraAttentionSnapshot) {
         guard accepts(generation) else { return }
-        var snapshot = snapshot
-        snapshot.calibrationProgress = calibrationCompleted ? 1 : calibrator.progress
-        snapshot.calibrationSecondsRemaining = calibrationStartedUptime.map { max(0, 20 - (ProcessInfo.processInfo.systemUptime - $0)) }
-        lastSnapshot = snapshot
         onUpdate(generation, snapshot)
     }
 
     private func state(_ status: CameraAttentionStatus, _ reason: String) {
         if [.disabled, .permissionNeeded, .unavailable].contains(status) { previewFrames.offer(nil, generation: generation) }
-        emit(.init(status: calibrationStartedUptime == nil ? status : .calibrating,
-                   reason: reason, calibrated: calibration != nil))
+        emit(.init(status: status, reason: reason, baselineReady: baseline.isReady))
     }
 
-    private var shouldRun: Bool { active || previewVisible || calibrationStartedUptime != nil }
-    private var shouldPreview: Bool { previewVisible || calibrationStartedUptime != nil }
+    private var shouldRun: Bool { active || previewVisible }
+    private var shouldPreview: Bool { previewVisible }
 
     private func startSession(token: UUID) {
         guard accepts(token), shouldRun else { return }
-        if let start = calibrationStartedUptime, ProcessInfo.processInfo.systemUptime - start >= 20 {
-            finishCalibration(succeeded: false)
-            if !shouldRun { return }
-        }
         startWatchdog()
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
-            calibrationStartedUptime = nil
             stopSession(); state(.permissionNeeded, "Allow Camera access for Onward in System Settings."); return
         }
         if session == nil {
@@ -293,8 +257,8 @@ private final class CameraAttentionWorker: NSObject, AVCaptureVideoDataOutputSam
                 self.session = session; self.output = output
                 if deviceID != device.uniqueID {
                     deviceID = device.uniqueID
-                    calibration = loadCalibration(deviceID: device.uniqueID)
-                    calibrator = CameraGazeCalibrator()
+                    baseline = HeadPoseBaseline(center: loadBaseline(deviceID: device.uniqueID))
+                    recentPoses.removeAll()
                     policy.reset()
                 }
             } catch {
@@ -306,8 +270,7 @@ private final class CameraAttentionWorker: NSObject, AVCaptureVideoDataOutputSam
         if !session.isRunning { session.startRunning() }
         guard accepts(token) else { stopSession(); return }
         if session.isRunning {
-            state(calibrationStartedUptime == nil ? .uncertain : .calibrating,
-                  calibrationStartedUptime == nil ? "Waiting for local camera evidence." : "Look at the center of your screen and hold still.")
+            state(.uncertain, "Waiting for local camera evidence.")
         } else { state(.unavailable, "The camera could not start. It may be in use by another app.") }
         startWatchdog()
     }
@@ -379,22 +342,12 @@ private final class CameraAttentionWorker: NSObject, AVCaptureVideoDataOutputSam
             guard let self, self.accepts(self.generation) else { return }
             let now = Date()
             let uptime = ProcessInfo.processInfo.systemUptime
-            // Wall-clock corrections cannot extend a temporary, paused-session capture.
-            if let start = self.calibrationStartedUptime, uptime - start >= 20 {
-                self.finishCalibration(succeeded: false); return
-            }
             if self.lastCapturedUptime.map({ uptime - $0 > 3 }) ?? true {
                 self.previewFrames.offer(nil, generation: self.generation)
             }
             if self.lastFrameAt.map({ now.timeIntervalSince($0) > CameraAttentionPolicy.maximumFrameGap }) ?? true {
                 self.policy.reset()
-                if self.calibrationStartedUptime != nil {
-                    _ = self.calibrator.add(nil, at: now)
-                    self.state(.calibrating, "Waiting for camera frames. Keep the camera connected.")
-                } else { self.state(.uncertain, "Waiting for usable camera frames.") }
-            } else if self.calibrationStartedUptime != nil, var snapshot = self.lastSnapshot {
-                snapshot.status = .calibrating
-                self.emit(snapshot)
+                self.state(.uncertain, "Waiting for usable camera frames.")
             }
             // Bounded retry cadence handles a disconnected camera without a busy loop.
             if self.session?.isRunning != true,
@@ -423,130 +376,84 @@ private final class CameraAttentionWorker: NSObject, AVCaptureVideoDataOutputSam
             }
             guard uptime - lastFrameTime >= 0.48 else { return }
             lastFrameTime = uptime
-            let request = VNDetectFaceLandmarksRequest()
-            request.revision = VNDetectFaceLandmarksRequestRevision3
+            let faceRequest = VNDetectFaceRectanglesRequest()
+            faceRequest.revision = VNDetectFaceRectanglesRequestRevision3
             do {
-                try VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up).perform([request])
+                let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up)
+                try handler.perform([faceRequest])
                 guard accepts(token), Date().timeIntervalSince(now) <= CameraAttentionPolicy.maximumFrameGap else { return }
-                if let start = calibrationStartedUptime, ProcessInfo.processInfo.systemUptime - start >= 20 {
-                    finishCalibration(succeeded: false); return
-                }
                 lastFrameAt = now
-                guard let faces = request.results else {
-                    _ = calibrator.add(nil, at: now)
-                    if calibrationStartedUptime != nil {
-                        state(.calibrating, "Vision returned no usable result. Keep facing the target.")
-                    } else { emit(policy.update(.uncertain, at: now, calibrated: calibration != nil)) }
-                    return
-                }
+                let faces = faceRequest.results ?? []
                 let face = faces.count == 1 ? faces[0] : nil
-                let reliableFace = face.map { $0.confidence >= 0.7 && $0.boundingBox.width >= 0.10 && $0.boundingBox.height >= 0.10 } ?? false
-                let imageSize = CGSize(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
-                let sample = reliableFace ? face.flatMap { gazeSample($0, imageSize: imageSize) } : nil
-                let faceBounds = reliableFace ? face?.boundingBox : nil
-                let pupils = sample != nil ? face.map(pupilPoints) ?? [] : []
-                if calibrationStartedUptime != nil {
-                    if let learned = calibrator.add(sample, at: now) {
-                        calibration = learned
-                        if let deviceID, let data = try? JSONEncoder().encode(StoredCalibration(deviceID: deviceID, calibration: learned)) {
-                            UserDefaults.standard.set(data, forKey: calibrationKey)
-                        }
-                        finishCalibration(succeeded: true, faceBounds: faceBounds, pupilPoints: pupils)
-                    } else {
-                        let reason: String
-                        if faces.isEmpty { reason = "No face found. Sit in view of the camera." }
-                        else if faces.count > 1 { reason = "More than one face is visible. Keep only your face in view." }
-                        else if !reliableFace { reason = "Move closer so your face is clear and well lit." }
-                        else if sample == nil { reason = "Eyes are not clear. Face the center target with both eyes open." }
-                        else { reason = calibrator.reason }
-                        emit(.init(status: .calibrating, reason: reason, calibrated: calibration != nil,
-                                   observedAt: now, faceBounds: faceBounds, pupilPoints: pupils))
-                    }
-                    return
+                // Head pose comes from the face box, so a small face in frame still works.
+                let reliable = face.map { $0.confidence >= 0.6 && $0.boundingBox.width >= 0.05 && $0.boundingBox.height >= 0.05 } ?? false
+                let pose = reliable ? face.flatMap(headPose) : nil
+                if let pose {
+                    recentPoses.append((now, pose))
+                    recentPoses.removeAll { now.timeIntervalSince($0.0) > 3 }
                 }
-                let evidence: CameraAttentionEvidence
-                if faces.isEmpty { evidence = .noFace }
-                else if !reliableFace { evidence = .uncertain }
-                else if let calibration { evidence = calibration.evidence(for: sample) }
-                else { evidence = .facePresent }
-                var snapshot = policy.update(evidence, at: now, calibrated: calibration != nil)
-                snapshot.faceBounds = faceBounds
-                snapshot.pupilPoints = pupils
-                snapshot.gazeOffset = calibration?.gazeOffset(for: sample)
+                // Body pose only runs when the face alone cannot decide, keeping the usual cost to one request.
+                var body = CameraBodyCue.none
+                var joints: [CameraBodyJoint: CGPoint] = [:]
+                if pose == nil && faces.count <= 1 {
+                    let bodyRequest = VNDetectHumanBodyPoseRequest()
+                    try? handler.perform([bodyRequest])
+                    joints = bodyJoints(bodyRequest.results ?? [])
+                    body = CameraBodyCue(joints: joints)
+                }
+                let wasReady = baseline.isReady
+                let evidence = CameraAttentionEstimate.evidence(faceCount: faces.count, pose: pose, body: body, baseline: &baseline)
+                if !wasReady && baseline.isReady { saveBaseline() }
+                let reason: String?
+                if faces.count > 1 { reason = "More than one face is visible." }
+                else if pose != nil && !baseline.isReady { reason = "Learning your usual screen direction. Keep working normally." }
+                else if pose != nil { reason = "Head partly turned. Waiting for a clearer reading." }
+                else if body == .facing { reason = "Body visible, but the face is unclear. Check the lighting." }
+                else { reason = nil }
+                var snapshot = policy.update(evidence, at: now, baselineReady: baseline.isReady, uncertainReason: reason)
+                snapshot.faceBounds = reliable ? face?.boundingBox : nil
+                snapshot.bodyPoints = Array(joints.values)
+                snapshot.headOffset = baseline.offset(for: pose)
                 emit(snapshot)
             } catch {
                 guard accepts(token) else { return }
                 lastFrameAt = now
-                _ = calibrator.add(nil, at: now)
-                if calibrationStartedUptime != nil {
-                    state(.calibrating, "Vision could not read this frame. Adjust the lighting and face the target.")
-                } else { emit(policy.update(.uncertain, at: now, calibrated: calibration != nil)) }
+                emit(policy.update(.uncertain, at: now, baselineReady: baseline.isReady))
             }
         }
     }
 
-    private func finishCalibration(succeeded: Bool, faceBounds: CGRect? = nil, pupilPoints: [CGPoint] = []) {
-        calibrationStartedUptime = nil; calibrator = CameraGazeCalibrator(); policy.reset()
-        calibrationCompleted = succeeded
-        updateFrameRate()
-        if !succeeded { previewFrames.offer(nil, generation: generation) }
-        emit(.init(status: succeeded ? (shouldRun ? .uncertain : .disabled) : .unavailable,
-                   reason: succeeded ? (shouldRun ? "Calibrated. Checking screen attention." : "Calibrated. Camera attention resumes with focus.")
-                    : "Calibration timed out. Keep both eyes visible, face the target, and retry.",
-                   calibrated: calibration != nil, faceBounds: faceBounds, pupilPoints: pupilPoints,
-                   gazeOffset: succeeded ? .zero : nil))
-        if !shouldPreview { previewFrames.offer(nil, generation: generation) }
-        if !shouldRun {
-            let token = generation
-            // Return the current sample buffer before synchronously stopping its capture session.
-            queue.async { [weak self] in
-                guard let self, self.accepts(token), !self.shouldRun else { return }
-                self.stopSession(); self.removeObservers()
+    private func headPose(_ face: VNFaceObservation) -> HeadPose? {
+        guard let yaw = face.yaw?.doubleValue, let pitch = face.pitch?.doubleValue else { return nil }
+        let pose = HeadPose(yaw: yaw, pitch: pitch)
+        return pose.isValid ? pose : nil
+    }
+
+    /// Picks the most visible person and keeps only confident head/shoulder joints.
+    private func bodyJoints(_ people: [VNHumanBodyPoseObservation]) -> [CameraBodyJoint: CGPoint] {
+        let names: [(CameraBodyJoint, VNHumanBodyPoseObservation.JointName)] = [
+            (.nose, .nose), (.leftEye, .leftEye), (.rightEye, .rightEye), (.leftEar, .leftEar), (.rightEar, .rightEar),
+            (.leftShoulder, .leftShoulder), (.rightShoulder, .rightShoulder), (.neck, .neck)]
+        let candidates = people.map { person -> [CameraBodyJoint: CGPoint] in
+            var joints: [CameraBodyJoint: CGPoint] = [:]
+            for (joint, name) in names {
+                if let point = try? person.recognizedPoint(name), point.confidence >= 0.35 { joints[joint] = point.location }
             }
+            return joints
         }
+        return candidates.max { $0.count < $1.count } ?? [:]
     }
 
-    private func pupilPoints(_ face: VNFaceObservation) -> [CGPoint] {
-        guard let landmarks = face.landmarks else { return [] }
-        return [landmarks.leftPupil, landmarks.rightPupil].compactMap { region in
-            guard let region, region.pointCount == 1 else { return nil }
-            let point = region.normalizedPoints[0]
-            return CGPoint(x: face.boundingBox.minX + point.x * face.boundingBox.width,
-                           y: face.boundingBox.minY + point.y * face.boundingBox.height)
-        }
+    private func saveBaseline() {
+        guard let deviceID, let center = baseline.center,
+              let data = try? JSONEncoder().encode(StoredBaseline(deviceID: deviceID, center: center)) else { return }
+        UserDefaults.standard.set(data, forKey: baselineKey)
     }
 
-    private func loadCalibration(deviceID: String) -> CameraGazeCalibration? {
-        guard let data = UserDefaults.standard.data(forKey: calibrationKey),
-              let saved = try? JSONDecoder().decode(StoredCalibration.self, from: data),
-              saved.deviceID == deviceID, saved.calibration.baseline.isValid else { return nil }
-        return saved.calibration
-    }
-
-    private func gazeSample(_ face: VNFaceObservation, imageSize: CGSize) -> CameraGazeSample? {
-        guard let yaw = face.yaw?.doubleValue, let pitch = face.pitch?.doubleValue,
-              let roll = face.roll?.doubleValue, abs(roll) <= 0.35,
-              let landmarks = face.landmarks, landmarks.confidence >= 0.5,
-              let left = pupil(eye: landmarks.leftEye, pupil: landmarks.leftPupil, face: face, imageSize: imageSize),
-              let right = pupil(eye: landmarks.rightEye, pupil: landmarks.rightPupil, face: face, imageSize: imageSize) else { return nil }
-        return .init(yaw: yaw, pitch: pitch, leftPupilX: left.x, leftPupilY: left.y,
-                     rightPupilX: right.x, rightPupilY: right.y)
-    }
-
-    private func pupil(eye: VNFaceLandmarkRegion2D?, pupil: VNFaceLandmarkRegion2D?, face: VNFaceObservation,
-                       imageSize: CGSize) -> (x: Double, y: Double)? {
-        guard let eye, eye.pointCount >= 4, let pupil, pupil.pointCount == 1 else { return nil }
-        let points = eye.normalizedPoints
-        guard let minX = points.map(\.x).min(), let maxX = points.map(\.x).max(),
-              let minY = points.map(\.y).min(), let maxY = points.map(\.y).max() else { return nil }
-        // Convert face-relative proportions to the image plane before checking eye openness.
-        let width = (maxX - minX) * face.boundingBox.width * imageSize.width
-        let height = (maxY - minY) * face.boundingBox.height * imageSize.height
-        guard width >= 8, height / width >= 0.14, height / width <= 0.65 else { return nil }
-        let point = pupil.normalizedPoints[0]
-        let x = (point.x - minX) / (maxX - minX)
-        let y = (point.y - (minY + maxY) / 2) * face.boundingBox.height * imageSize.height / width
-        guard x.isFinite, y.isFinite, (0...1).contains(x), abs(y) <= 0.4 else { return nil }
-        return (Double(x), Double(y))
+    private func loadBaseline(deviceID: String) -> HeadPose? {
+        guard let data = UserDefaults.standard.data(forKey: baselineKey),
+              let saved = try? JSONDecoder().decode(StoredBaseline.self, from: data),
+              saved.deviceID == deviceID, saved.center.isValid else { return nil }
+        return saved.center
     }
 }

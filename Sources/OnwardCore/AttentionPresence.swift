@@ -2,7 +2,7 @@ import Foundation
 import CoreGraphics
 
 public enum CameraAttentionStatus: String, Codable, Sendable {
-    case disabled, permissionNeeded, calibrating, present, lookingAway, absent, uncertain, unavailable
+    case disabled, permissionNeeded, present, lookingAway, absent, uncertain, unavailable
 }
 
 public enum CameraAttentionReason: String, Codable, Sendable {
@@ -13,35 +13,33 @@ public struct CameraAttentionSnapshot: Equatable, Sendable {
     public var status: CameraAttentionStatus
     public var isDistracted: Bool
     public var reason: String
-    public var calibrated: Bool
+    /// True once Onward knows the user's usual screen-facing head direction.
+    public var baselineReady: Bool
     public var observedAt: Date
     public var continuousSeconds: TimeInterval
     public var distractionReason: CameraAttentionReason?
     /// Vision coordinates: unmirrored, normalized, with the origin at the bottom left.
     public var faceBounds: CGRect?
-    public var pupilPoints: [CGPoint]
-    /// Coarse pupil direction relative to calibration: positive means user-right/up.
-    public var gazeOffset: CGPoint?
-    public var calibrationProgress: Double
-    public var calibrationSecondsRemaining: Double?
+    /// Visible body joints (head and shoulders) in Vision coordinates, for the live view only.
+    public var bodyPoints: [CGPoint]
+    /// Head turn (x, yaw) and tilt (y, pitch) relative to the usual screen direction;
+    /// magnitude 1 is the looking-away limit. Not a position on the screen.
+    public var headOffset: CGPoint?
 
     public init(status: CameraAttentionStatus, isDistracted: Bool = false, reason: String = "",
-                calibrated: Bool = false, observedAt: Date = Date(), continuousSeconds: TimeInterval = 0,
+                baselineReady: Bool = false, observedAt: Date = Date(), continuousSeconds: TimeInterval = 0,
                 distractionReason: CameraAttentionReason? = nil, faceBounds: CGRect? = nil,
-                pupilPoints: [CGPoint] = [], gazeOffset: CGPoint? = nil,
-                calibrationProgress: Double = 0, calibrationSecondsRemaining: Double? = nil) {
+                bodyPoints: [CGPoint] = [], headOffset: CGPoint? = nil) {
         self.status = status
         self.isDistracted = isDistracted
         self.reason = reason
-        self.calibrated = calibrated
+        self.baselineReady = baselineReady
         self.observedAt = observedAt
         self.continuousSeconds = continuousSeconds
         self.distractionReason = distractionReason
         self.faceBounds = faceBounds
-        self.pupilPoints = pupilPoints
-        self.gazeOffset = gazeOffset
-        self.calibrationProgress = calibrationProgress
-        self.calibrationSecondsRemaining = calibrationSecondsRemaining
+        self.bodyPoints = bodyPoints
+        self.headOffset = headOffset
     }
 
     public func isFresh(at now: Date) -> Bool {
@@ -51,7 +49,7 @@ public struct CameraAttentionSnapshot: Equatable, Sendable {
 }
 
 public enum CameraAttentionEvidence: Equatable, Sendable {
-    case present, facePresent, lookingAway, noFace, uncertain
+    case present, lookingAway, noFace, uncertain
 }
 
 /// Camera evidence is independent of the goal classifier. Unknown frames never imply attention.
@@ -73,7 +71,7 @@ public struct CameraAttentionPolicy: Sendable {
     public mutating func reset() { self = Self() }
 
     public mutating func update(_ evidence: CameraAttentionEvidence, at now: Date,
-                                calibrated: Bool) -> CameraAttentionSnapshot {
+                                baselineReady: Bool = true, uncertainReason: String? = nil) -> CameraAttentionSnapshot {
         if let lastFrameAt, now < lastFrameAt || now.timeIntervalSince(lastFrameAt) > Self.maximumFrameGap {
             reset()
         }
@@ -81,33 +79,25 @@ public struct CameraAttentionPolicy: Sendable {
         switch evidence {
         case .uncertain:
             candidate = nil; candidateSince = nil; distracted = nil; returnSince = nil
-            latest = .init(status: .uncertain, reason: "Camera cannot estimate attention reliably.",
-                           calibrated: calibrated, observedAt: now)
-        case .present, .facePresent:
-            guard (evidence == .present && calibrated) || (evidence == .facePresent && !calibrated) else {
-                return update(.uncertain, at: now, calibrated: calibrated)
-            }
+            latest = .init(status: .uncertain, reason: uncertainReason ?? "Camera cannot estimate attention reliably.",
+                           baselineReady: baselineReady, observedAt: now)
+        case .present:
             if returnSince == nil { returnSince = now }
             let elapsed = now.timeIntervalSince(returnSince!)
             if elapsed >= Self.returnGrace {
                 candidate = nil; candidateSince = nil; distracted = nil
-                latest = .init(status: .present,
-                               reason: calibrated ? "Facing the calibrated screen position." : "Face detected; calibrate to check gaze.",
-                               calibrated: calibrated, observedAt: now, continuousSeconds: elapsed)
+                latest = .init(status: .present, reason: "Facing your screen.",
+                               baselineReady: baselineReady, observedAt: now, continuousSeconds: elapsed)
             } else if let distracted {
                 latest = .init(status: distracted == .noFace ? .absent : .lookingAway, isDistracted: true,
-                               reason: "Checking return to the screen.", calibrated: calibrated, observedAt: now,
+                               reason: "Checking return to the screen.", baselineReady: baselineReady, observedAt: now,
                                continuousSeconds: elapsed, distractionReason: distracted)
             } else {
                 candidate = nil; candidateSince = nil
                 latest = .init(status: .uncertain, reason: "Checking screen attention.",
-                               calibrated: calibrated, observedAt: now, continuousSeconds: elapsed)
+                               baselineReady: baselineReady, observedAt: now, continuousSeconds: elapsed)
             }
         case .lookingAway, .noFace:
-            // Absence needs no calibration. A gaze judgment always does.
-            guard evidence != .lookingAway || calibrated else {
-                return update(.uncertain, at: now, calibrated: false)
-            }
             returnSince = nil
             let reason: CameraAttentionReason = evidence == .noFace ? .noFace : .lookingAway
             if candidate != reason {
@@ -118,8 +108,8 @@ public struct CameraAttentionPolicy: Sendable {
             if elapsed >= grace { distracted = reason }
             latest = .init(status: reason == .noFace ? .absent : .lookingAway,
                            isDistracted: distracted != nil,
-                           reason: reason == .noFace ? "No face detected by the camera." : "Looking away from the calibrated screen position.",
-                           calibrated: calibrated, observedAt: now, continuousSeconds: elapsed,
+                           reason: reason == .noFace ? "No one is in view of the camera." : "Your head or body is turned well away from the screen.",
+                           baselineReady: baselineReady, observedAt: now, continuousSeconds: elapsed,
                            distractionReason: reason)
         }
         return latest
@@ -129,108 +119,124 @@ public struct CameraAttentionPolicy: Sendable {
         guard let lastFrameAt, now >= lastFrameAt,
               now.timeIntervalSince(lastFrameAt) <= Self.maximumFrameGap else {
             return .init(status: .uncertain, reason: "Camera evidence is stale.",
-                         calibrated: latest.calibrated, observedAt: lastFrameAt ?? .distantPast)
+                         baselineReady: latest.baselineReady, observedAt: lastFrameAt ?? .distantPast)
         }
         return latest
     }
 }
 
-/// Only numeric geometry survives a frame. Pupil Y uses eye width to reduce blink amplification.
-public struct CameraGazeSample: Codable, Equatable, Sendable {
+/// Vision head pose in radians. Eyes are not used: at webcam distance they are a few pixels wide.
+public struct HeadPose: Codable, Equatable, Sendable {
     public var yaw: Double
     public var pitch: Double
-    public var leftPupilX: Double
-    public var leftPupilY: Double
-    public var rightPupilX: Double
-    public var rightPupilY: Double
-
-    public init(yaw: Double, pitch: Double, leftPupilX: Double, leftPupilY: Double,
-                rightPupilX: Double, rightPupilY: Double) {
-        self.yaw = yaw; self.pitch = pitch
-        self.leftPupilX = leftPupilX; self.leftPupilY = leftPupilY
-        self.rightPupilX = rightPupilX; self.rightPupilY = rightPupilY
-    }
-
+    public init(yaw: Double, pitch: Double) { self.yaw = yaw; self.pitch = pitch }
     public var isValid: Bool {
-        values.allSatisfy(\.isFinite) && abs(yaw) <= .pi / 2 && abs(pitch) <= .pi / 2
-            && (0...1).contains(leftPupilX) && (0...1).contains(rightPupilX)
-            && abs(leftPupilY) <= 0.4 && abs(rightPupilY) <= 0.4
-    }
-
-    fileprivate var values: [Double] { [yaw, pitch, leftPupilX, leftPupilY, rightPupilX, rightPupilY] }
-}
-
-public struct CameraGazeCalibration: Codable, Equatable, Sendable {
-    public var baseline: CameraGazeSample
-    public init(baseline: CameraGazeSample) { self.baseline = baseline }
-
-    /// Conservative bands are heuristics, not an eye tracker or a screen-coordinate estimate.
-    public func evidence(for sample: CameraGazeSample?) -> CameraAttentionEvidence {
-        guard let sample, let pupil = pupilDisplacement(for: sample) else { return .uncertain }
-        let yaw = abs(sample.yaw - baseline.yaw), pitch = abs(sample.pitch - baseline.pitch)
-        let x = abs(pupil.x), y = abs(pupil.y)
-        if yaw >= 0.38 || pitch >= 0.30 || x >= 0.22 || y >= 0.14 { return .lookingAway }
-        if yaw <= 0.22 && pitch <= 0.18 && x <= 0.12 && y <= 0.075 { return .present }
-        return .uncertain
-    }
-
-    /// Display direction only; this is not a gaze position on the screen.
-    /// Raw image-right is user-left. Head pose is excluded because its direction is not calibrated.
-    public func gazeOffset(for sample: CameraGazeSample?) -> CGPoint? {
-        guard let pupil = pupilDisplacement(for: sample) else { return nil }
-        return CGPoint(x: max(-1, min(1, -pupil.x / 0.22)),
-                       y: max(-1, min(1, pupil.y / 0.14)))
-    }
-
-    private func pupilDisplacement(for sample: CameraGazeSample?) -> (x: Double, y: Double)? {
-        guard let sample, sample.isValid, baseline.isValid else { return nil }
-        let lx = sample.leftPupilX - baseline.leftPupilX
-        let rx = sample.rightPupilX - baseline.rightPupilX
-        let ly = sample.leftPupilY - baseline.leftPupilY
-        let ry = sample.rightPupilY - baseline.rightPupilY
-        // Disagreeing eye estimates can be blinks, occlusion or faulty landmarks.
-        guard abs(lx - rx) <= 0.18, abs(ly - ry) <= 0.12 else { return nil }
-        return ((lx + rx) / 2, (ly + ry) / 2)
+        yaw.isFinite && pitch.isFinite && abs(yaw) <= .pi / 2 && abs(pitch) <= .pi / 2
     }
 }
 
-/// Explicit calibration requires six consecutive stable, usable samples spanning 2.5 seconds.
-public struct CameraGazeCalibrator: Sendable {
-    private var samples: [(Date, CameraGazeSample)] = []
-    public init() {}
-    public var sampleCount: Int { samples.count }
-    public private(set) var reason = "Look at the screen and hold still."
-    public var progress: Double {
-        guard let first = samples.first, let last = samples.last else { return 0 }
-        return min(1, Double(samples.count) / 6, max(0, last.0.timeIntervalSince(first.0)) / 2.5)
-    }
+/// Learns the user's usual screen-facing head direction without a calibration step, then
+/// flags only large turns away from it. Screens beside the camera shift the learned center.
+public struct HeadPoseBaseline: Codable, Equatable, Sendable {
+    /// Beyond 35° left/right or 30° up/down from the usual direction counts as looking away.
+    public static let awayYaw = 0.61, awayPitch = 0.52
+    /// Within 24° / 20° counts as facing the screen; between the bands stays uncertain.
+    public static let presentYaw = 0.42, presentPitch = 0.35
+    /// Automatic learning only accepts roughly camera-facing poses.
+    public static let learningLimit = 0.6
+    public static let learningSamples = 6
 
-    public mutating func add(_ sample: CameraGazeSample?, at now: Date) -> CameraGazeCalibration? {
-        guard let sample, sample.isValid, now.timeIntervalSinceReferenceDate.isFinite else {
-            samples.removeAll(); reason = "Waiting for a clear view of both eyes."; return nil
-        }
-        guard abs(sample.yaw) < 0.40, abs(sample.pitch) < 0.35 else {
-            samples.removeAll(); reason = "Face the screen to calibrate."; return nil
-        }
-        reason = "Keep looking at the screen and hold still."
-        if let previous = samples.last,
-           now <= previous.0 || now.timeIntervalSince(previous.0) > CameraAttentionPolicy.maximumFrameGap {
-            samples.removeAll()
-            reason = "Camera frames were interrupted. Hold still to restart."
-        }
-        if let first = samples.first {
-            let difference = zip(sample.values, first.1.values).map { abs($0 - $1) }
-            if difference[0] > 0.12 || difference[1] > 0.12 || difference.dropFirst(2).contains(where: { $0 > 0.09 }) {
-                samples.removeAll()
-                reason = "Movement restarted calibration. Hold still."
+    public private(set) var center: HeadPose?
+    private var learning: [HeadPose] = []
+
+    public init(center: HeadPose? = nil) { self.center = center?.isValid == true ? center : nil }
+
+    public var isReady: Bool { center != nil }
+
+    public mutating func classify(_ pose: HeadPose) -> CameraAttentionEvidence {
+        guard pose.isValid else { return .uncertain }
+        guard let center else {
+            guard abs(pose.yaw) <= Self.learningLimit, abs(pose.pitch) <= Self.learningLimit else {
+                learning.removeAll(); return .uncertain
             }
+            learning.append(pose)
+            if learning.count >= Self.learningSamples {
+                self.center = Self.median(learning); learning.removeAll()
+            }
+            return .uncertain
         }
-        samples.append((now, sample))
-        if samples.count > 12 { samples.removeFirst(samples.count - 12) }
-        guard samples.count >= 6, now.timeIntervalSince(samples[0].0) >= 2.5 else { return nil }
-        reason = "Calibration complete."
-        let means = (0..<6).map { index in samples.map { $0.1.values[index] }.reduce(0, +) / Double(samples.count) }
-        return .init(baseline: .init(yaw: means[0], pitch: means[1], leftPupilX: means[2], leftPupilY: means[3],
-                                    rightPupilX: means[4], rightPupilY: means[5]))
+        let yaw = pose.yaw - center.yaw, pitch = pose.pitch - center.pitch
+        if abs(yaw) >= Self.awayYaw || abs(pitch) >= Self.awayPitch { return .lookingAway }
+        guard abs(yaw) <= Self.presentYaw, abs(pitch) <= Self.presentPitch else { return .uncertain }
+        // Follow slow posture changes only from screen-facing samples, so time spent
+        // looking away cannot drag the center toward the distraction.
+        self.center = HeadPose(yaw: center.yaw + 0.03 * yaw, pitch: center.pitch + 0.03 * pitch)
+        return .present
+    }
+
+    /// The user's explicit "I'm facing my screen" uses recent samples, not one frame.
+    public mutating func setCenter(from recent: [HeadPose]) -> Bool {
+        let valid = recent.filter(\.isValid)
+        guard valid.count >= 2 else { return false }
+        center = Self.median(valid); learning.removeAll()
+        return true
+    }
+
+    public func offset(for pose: HeadPose?) -> CGPoint? {
+        guard let pose, pose.isValid, let center else { return nil }
+        // Signed Vision deltas; the UI shows magnitudes because the sign convention is unverified.
+        return CGPoint(x: max(-1.5, min(1.5, (pose.yaw - center.yaw) / Self.awayYaw)),
+                       y: max(-1.5, min(1.5, (pose.pitch - center.pitch) / Self.awayPitch)))
+    }
+
+    private static func median(_ poses: [HeadPose]) -> HeadPose {
+        func middle(_ values: [Double]) -> Double {
+            let sorted = values.sorted(), count = sorted.count
+            return count % 2 == 1 ? sorted[count / 2] : (sorted[count / 2 - 1] + sorted[count / 2]) / 2
+        }
+        return HeadPose(yaw: middle(poses.map(\.yaw)), pitch: middle(poses.map(\.pitch)))
+    }
+}
+
+public enum CameraBodyJoint: String, CaseIterable, Sendable {
+    case nose, leftEye, rightEye, leftEar, rightEar, leftShoulder, rightShoulder, neck
+}
+
+/// What the body pose says when the face detector finds no usable face.
+public enum CameraBodyCue: Equatable, Sendable {
+    case none, facing, turnedAway, unclear
+
+    /// `joints` contains only confidently visible joints, in any normalized image coordinates.
+    public init(joints: [CameraBodyJoint: CGPoint]) {
+        let eyes = [joints[.leftEye], joints[.rightEye]].compactMap { $0 }.count
+        let nose = joints[.nose] != nil
+        let anchored = [CameraBodyJoint.neck, .leftShoulder, .rightShoulder, .leftEar, .rightEar].contains { joints[$0] != nil }
+        guard anchored || nose else { self = .none; return }
+        if nose && eyes == 2 {
+            // Facial features are visible; a nose far outside the shoulders still means a strong turn.
+            if let left = joints[.leftShoulder], let right = joints[.rightShoulder], let point = joints[.nose],
+               abs(left.x - right.x) > 0.02,
+               abs(point.x - (left.x + right.x) / 2) / abs(left.x - right.x) > 0.5 {
+                self = .turnedAway
+            } else { self = .facing }
+        } else if (!nose && eyes == 0 && anchored) || (nose && eyes == 1 && (joints[.leftEar] == nil) != (joints[.rightEar] == nil)) {
+            // Back of the head, or a profile with one eye and one ear visible.
+            self = .turnedAway
+        } else { self = .unclear }
+    }
+}
+
+public enum CameraAttentionEstimate {
+    /// Combines one frame's face and body evidence. A single reliable face decides by head
+    /// direction; the body is consulted only when no usable face is found.
+    public static func evidence(faceCount: Int, pose: HeadPose?, body: CameraBodyCue,
+                                baseline: inout HeadPoseBaseline) -> CameraAttentionEvidence {
+        guard faceCount <= 1 else { return .uncertain }
+        if faceCount == 1, let pose { return baseline.classify(pose) }
+        switch body {
+        case .turnedAway: return .lookingAway
+        case .none: return faceCount == 0 ? .noFace : .uncertain
+        case .facing, .unclear: return .uncertain
+        }
     }
 }

@@ -67,7 +67,7 @@ enum CommandLineTools {
                     print(String(decoding: data, as: UTF8.self))
                 } else { print(String(data: try AppStorage.encoder.encode(observation), encoding: .utf8)!) }
             case "--render-preview":
-                guard (2...6).contains(arguments.count) else { throw CLIError.message("Provide a PNG path, optional view (now/activity/settings/goals/review/learned/camera/calibration/hud/glow), state, theme (light/dark), and dimensions (980x780).") }
+                guard (2...6).contains(arguments.count) else { throw CLIError.message("Provide a PNG path, optional view (now/activity/settings/goals/review/learned/camera/hud/glow), state, theme (light/dark), and dimensions (980x780).") }
                 let dimensions = arguments.count > 5 ? arguments[5].split(separator: "x").compactMap { Double($0) } : [980, 780]
                 guard dimensions.count == 2, dimensions[0] >= 860, dimensions[1] >= 690,
                       dimensions[0] <= 2000, dimensions[1] <= 2000 else { throw CLIError.message("Preview dimensions must be 860x690 through 2000x2000.") }
@@ -165,19 +165,18 @@ enum CommandLineTools {
             spend.record(receipt: JevSpendReceipt(responseData: Data(#"{"model":"jev-1.13.0","usage":{"input_tokens":184250}}"#.utf8)), at: Date())
             model.spendLedger = spend
         }
-        if ["camera", "calibration"].contains(surface) {
-            let calibrating = surface == "calibration" && state != "complete"
+        if surface == "camera" {
+            let away = state == "looking-away", learning = state == "learning"
             model.setCameraPreviewFixture(frame: cameraPreviewFixture(), snapshot: CameraAttentionSnapshot(
-                status: calibrating ? .calibrating : (state == "looking-away" ? .lookingAway : .present),
-                reason: calibrating ? "Stable eyes detected. Keep looking at the target."
-                    : state == "looking-away" ? "Looking away from the calibrated screen position." : "Facing the calibrated screen position.",
-                calibrated: !calibrating, faceBounds: CGRect(x: 0.31, y: 0.23, width: 0.38, height: 0.56),
-                pupilPoints: [CGPoint(x: 0.42, y: 0.58), CGPoint(x: 0.58, y: 0.58)],
-                gazeOffset: calibrating ? nil : CGPoint(x: state == "looking-away" ? 0.8 : 0.08, y: 0.12),
-                calibrationProgress: calibrating ? 0.6 : 1, calibrationSecondsRemaining: calibrating ? 14 : nil))
+                status: away ? .lookingAway : learning ? .uncertain : .present,
+                reason: away ? "Your head or body is turned well away from the screen."
+                    : learning ? "Learning your usual screen direction. Keep working normally." : "Facing your screen.",
+                baselineReady: !learning, faceBounds: CGRect(x: 0.31, y: 0.23, width: 0.38, height: 0.56),
+                bodyPoints: [CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.25, y: 0.12), CGPoint(x: 0.75, y: 0.12)],
+                headOffset: learning ? nil : CGPoint(x: away ? 1.2 : 0.2, y: away ? 0.3 : 0.1)))
         }
         let size = surface == "hud" ? NSSize(width: GoalHUD.canvasWidth, height: GoalHUD.canvasHeight)
-            : surface == "calibration" ? NSSize(width: 690, height: 580) : dimensions
+            : dimensions
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
         window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         window.isOpaque = surface != "hud"; window.backgroundColor = surface == "hud" ? .clear : .windowBackgroundColor
@@ -191,7 +190,6 @@ enum CommandLineTools {
         case "review": root = AnyView(Dashboard(model: model, initialSelection: "Review"))
         case "learned": root = AnyView(Dashboard(model: model, initialSelection: "Review", initialReviewSection: "Learned examples"))
         case "camera": root = AnyView(Dashboard(model: model, initialSelection: "Camera"))
-        case "calibration": root = AnyView(CameraCalibrationView(model: model, automaticallyStart: false))
         case "now": root = AnyView(Dashboard(model: model))
         default: throw CLIError.message("Unknown preview view: \(surface)")
         }

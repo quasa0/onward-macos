@@ -57,7 +57,6 @@ struct Dashboard: View {
     @State private var inspect = false
     @State private var correctionMessage: String?
     @State private var reviewSection = "To review"
-    @State private var cameraCalibration = false
 
     init(model: ObserverModel, initialSelection: String = "Now", initialReviewSection: String = "To review") {
         self.model = model
@@ -77,7 +76,7 @@ struct Dashboard: View {
                     else if selection == "Goals" { GoalsView(model: model) }
                     else if selection == "Review" { ReviewView(model: model, initialSection: reviewSection) }
                     else if selection == "Activity" { activityView }
-                    else if selection == "Camera" { CameraAttentionView(model: model, calibrate: { cameraCalibration = true }) }
+                    else if selection == "Camera" { CameraAttentionView(model: model) }
                     else { SettingsView(model: model) }
                 }.padding(32).frame(maxWidth: 800, alignment: .leading).frame(maxWidth: .infinity)
             }.background(Color(nsColor: .windowBackgroundColor))
@@ -91,12 +90,10 @@ struct Dashboard: View {
             .onReceive(NotificationCenter.default.publisher(for: .onwardNavigate)) { notification in
                 if let destination = notification.object as? String {
                     if destination == "Review" { openReview() }
-                    else if destination == "Camera calibration" { selection = "Camera"; cameraCalibration = true }
                     else { selection = destination }
                 }
             }
             .sheet(isPresented: $inspect) { EvidenceView(model: model) }
-            .sheet(isPresented: $cameraCalibration) { CameraCalibrationView(model: model) }
     }
 
     private var sidebar: some View {
@@ -146,7 +143,7 @@ struct Dashboard: View {
                     .fixedSize(horizontal: false, vertical: true).lineSpacing(3)
             }.padding(.top, 4)
             if model.cameraEnabled {
-                CameraPreviewCard(model: model, open: { selection = "Camera" }, calibrate: { cameraCalibration = true })
+                CameraPreviewCard(model: model, open: { selection = "Camera" })
             }
             Card {
                 VStack(alignment: .leading, spacing: 18) {

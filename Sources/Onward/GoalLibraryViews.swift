@@ -724,8 +724,7 @@ struct CameraAttentionSettingsView: View {
         switch snapshot.status {
         case .disabled: return model.cameraEnabled ? "Camera paused" : "Camera off"
         case .permissionNeeded: return "Camera permission needed"
-        case .calibrating: return "Calibrating — look at the target dot"
-        case .present: return snapshot.calibrated ? "Facing the screen" : "Face detected"
+        case .present: return "Facing the screen"
         case .lookingAway: return snapshot.isDistracted ? "Looking away" : "Looking away · within grace period"
         case .absent: return snapshot.isDistracted ? "No face detected" : "No face detected · within grace period"
         case .uncertain: return "Camera is unsure"
@@ -737,7 +736,6 @@ struct CameraAttentionSettingsView: View {
         switch snapshot.status {
         case .disabled: return "camera"
         case .permissionNeeded: return "lock"
-        case .calibrating: return "viewfinder"
         case .present: return "checkmark.circle"
         case .lookingAway: return "eye.slash"
         case .absent: return "person.crop.circle.badge.questionmark"
@@ -756,7 +754,7 @@ struct CameraAttentionSettingsView: View {
                 Toggle("Camera attention", isOn: Binding(get: { model.cameraEnabled }, set: model.setCameraEnabled))
                     .labelsHidden().fixedSize().disabled(model.cameraPermissionPending)
             }
-            Text("Uses Apple Vision on this Mac to estimate face presence and screen attention. No photos or video are saved or sent to Jev.")
+            Text("Uses Apple Vision on this Mac to estimate where your head and body face. No photos or video are saved or sent to Jev.")
                 .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(2)
                 .fixedSize(horizontal: false, vertical: true)
             if model.cameraEnabled || snapshot.status == .permissionNeeded || model.cameraPermissionPending {
@@ -776,11 +774,9 @@ struct CameraAttentionSettingsView: View {
                 }
                 if model.cameraEnabled {
                     HStack(spacing: 12) {
-                        Button(snapshot.calibrated ? "Recalibrate" : "Calibrate for this screen", systemImage: "viewfinder") {
-                            NotificationCenter.default.post(name: .onwardNavigate, object: "Camera calibration")
-                        }
-                            .disabled(snapshot.status == .calibrating || model.cameraPermissionPending)
-                        Text(snapshot.calibrated ? "Calibrate again if your screen or position changes." : "Open calibration and follow the target dot.")
+                        Button("I'm facing my screen", systemImage: "scope", action: model.useCurrentCameraDirection)
+                            .disabled(model.cameraPermissionPending)
+                        Text("Optional. Onward learns your usual direction by itself; use this if your screen is far from the camera.")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -789,7 +785,7 @@ struct CameraAttentionSettingsView: View {
                     }
                 }
             }
-            Text("Allows 8 seconds of looking away or 12 seconds without a face before treating it as distraction. Calibration shows a target, timer and your live camera view.")
+            Text("Only large turns count: about 35° sideways or 30° up or down from your usual direction, for 8 seconds, or nobody in view for 12 seconds. Eyes are not tracked.")
                 .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(2)
                 .fixedSize(horizontal: false, vertical: true)
             Text("Attention is approximate. The camera cannot tell what you are looking at or whether you are using a phone.")

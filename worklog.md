@@ -1,5 +1,11 @@
 # Worklog
 
+## 2026-10-07 — MIT license and public GitHub release
+
+- User asked to publish Onward (macOS focus app) on GitHub under MIT. Added `LICENSE` (MIT, "Copyright (c) 2026 quasa0") and a License section in `README.md`. `THIRD_PARTY_NOTICES.md` already covers the Apache-2.0 Codex-derived function.
+- Pre-publish audit: scanned all 8 commits and tracked files for API keys, tokens, and private keys; none found. The app reads `TYPESAFE_API_KEY` only from a user-supplied env file and stores it in Keychain. Local state (`goals.json`, `activity*.jsonl`, `.runtime/`, `dist/`) is gitignored and untracked. Known residue: commit author is the configured git identity, and `worklog.md` contains local absolute paths and PIDs from past sessions.
+- Repository `quasa0/onward-macos` switched from private to public. Default branch remains `quasa0/onward`.
+
 ## 2026-09-23 — Camera attention without eyes or calibration: learned head direction plus body pose
 
 - User reported that gaze calibration did not work and that their eyes are too small in the camera frame. The old path required a saved calibration, used pupil positions (a few pixels wide at webcam distance), and restarted calibration on pupil jitter above 0.09 eye widths. It could never report "facing the screen" uncalibrated.

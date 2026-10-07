@@ -70,3 +70,7 @@ The same directory stores `screenshots/` (review images, described above), `goal
 Requires macOS 14+, Swift 5.10+, and a TypeSafe key. No package dependencies. The optional Chromium extension uses `chrome.debugger` and displays the browser's debugger banner. It is not needed for ordinary Helium tab identity, native app text, or local OCR.
 
 Source reuse and evidence are recorded in `THIRD_PARTY_NOTICES.md` and `references/capture-architecture.md`.
+
+## License
+
+MIT. See `LICENSE`. Third-party code and notices are listed in `THIRD_PARTY_NOTICES.md`.
